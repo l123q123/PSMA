@@ -1,0 +1,29 @@
+# Python 解释器缓存和测试缓存。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本地 IDE 配置。
+.idea/
+.vscode/
+
+# 实验输出、临时缓存和本地运行日志。
+outputs/
+tmp/
+*.log
+
+# 数据集、深度缓存与模型权重。
+data/
+datasets/
+*.exr
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# 私钥和环境配置。
+*.pem
+*.key
+.env
