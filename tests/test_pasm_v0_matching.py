@@ -5,12 +5,15 @@ import unittest
 import numpy as np
 import torch
 
+from pasm_v0.config import PasmV0Config
 from pasm_v0.matching import (
+    PairLocalQualityEncoder,
     PairSemanticEncoder,
     global_edge_weights,
     patch_feedback,
     select_anchor_matches,
 )
+from pasm_v0.sampling import PatchLayout
 
 
 class PasmV0MatchingTests(unittest.TestCase):
@@ -93,6 +96,39 @@ class PasmV0MatchingTests(unittest.TestCase):
         self.assertEqual(tuple(value_a.shape), (1, 4))
         self.assertEqual(tuple(value_b.shape), (1, 4))
         self.assertTrue(torch.all((value_a >= 0.0) & (value_a <= 1.0)))
+
+    def test_local_quality_encoder_returns_dense_joint_descriptors_and_logits(self) -> None:
+        """局部质量网络必须从双图语义生成可反传的密集输出。"""
+        config = PasmV0Config(
+            image_size=32,
+            patch_rows=4,
+            patch_cols=4,
+            quality_cells_per_axis=2,
+            total_points=32,
+            round_min_points=(2, 1, 0),
+            max_points_per_patch=4,
+        )
+        torch.manual_seed(7)
+        encoder = PairLocalQualityEncoder(local_dim=4, semantic_dim=8, heads=2)
+        grid_a = torch.randn(4, 32, 32)
+        grid_b = torch.randn(4, 32, 32)
+        semantic_a = torch.randn(1, 16, 8)
+        semantic_b = torch.randn(1, 16, 8)
+
+        descriptors_a, descriptors_b, logits_a, logits_b = encoder(
+            grid_a, grid_b, semantic_a, semantic_b, PatchLayout(config)
+        )
+        loss = descriptors_a.sum() + descriptors_b.sum() + logits_a.sum() + logits_b.sum()
+        loss.backward()
+
+        self.assertEqual(tuple(descriptors_a.shape), (8, 8, 8))
+        self.assertEqual(tuple(descriptors_b.shape), (8, 8, 8))
+        self.assertEqual(tuple(logits_a.shape), (1, 8, 8))
+        self.assertEqual(tuple(logits_b.shape), (1, 8, 8))
+        self.assertTrue(torch.isfinite(logits_a).all())
+        self.assertIsNotNone(encoder.quality_head.weight.grad)
+        self.assertIsNotNone(encoder.local_projection.weight.grad)
+        self.assertIsNotNone(encoder.cross_attention.in_proj_weight.grad)
 
 
 if __name__ == "__main__":

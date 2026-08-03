@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from torch.nn import functional as functional
 
+from .sampling import PatchLayout
+
 
 @dataclass(frozen=True)
 class AnchorMatches:
@@ -20,7 +22,7 @@ class AnchorMatches:
 
 
 class PairSemanticEncoder(nn.Module):
-    """使用一层共享双向 Cross-Attention 条件化管理 Patch 语义。"""
+    """使用自注意力和共享双向 Cross-Attention 条件化管理 Patch 语义。"""
 
     def __init__(self, token_dim: int, hidden_dim: int = 128, heads: int = 4) -> None:
         """创建语义投影、共享注意力层和 Patch 价值头。"""
@@ -28,7 +30,9 @@ class PairSemanticEncoder(nn.Module):
         if token_dim <= 0 or hidden_dim <= 0 or heads <= 0 or hidden_dim % heads:
             raise ValueError("语义维度和注意力头数无效")
         self.projection = nn.Linear(token_dim, hidden_dim)
-        self.attention = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
+        self.self_attention = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
+        self.cross_attention_second = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
         self.normalization = nn.LayerNorm(hidden_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
 
@@ -39,13 +43,70 @@ class PairSemanticEncoder(nn.Module):
         _validate_tokens(tokens_a, tokens_b)
         base_a = self.normalization(self.projection(tokens_a))
         base_b = self.normalization(self.projection(tokens_b))
-        message_a, _ = self.attention(base_a, base_b, base_b, need_weights=False)
-        message_b, _ = self.attention(base_b, base_a, base_a, need_weights=False)
-        semantic_a = functional.normalize(base_a + message_a, dim=-1, eps=1e-6)
-        semantic_b = functional.normalize(base_b + message_b, dim=-1, eps=1e-6)
+        semantic_a = _attention_residual(self.self_attention, base_a, base_a, base_a)
+        semantic_b = _attention_residual(self.self_attention, base_b, base_b, base_b)
+        semantic_a, semantic_b = _bidirectional_cross_attention(
+            self.cross_attention, semantic_a, semantic_b
+        )
+        semantic_a, semantic_b = _bidirectional_cross_attention(
+            self.cross_attention_second, semantic_a, semantic_b
+        )
+        semantic_a = functional.normalize(semantic_a, dim=-1, eps=1e-6)
+        semantic_b = functional.normalize(semantic_b, dim=-1, eps=1e-6)
         value_a = torch.sigmoid(self.value_head(semantic_a).squeeze(-1))
         value_b = torch.sigmoid(self.value_head(semantic_b).squeeze(-1))
         return semantic_a, semantic_b, value_a, value_b
+
+
+class PairLocalQualityEncoder(nn.Module):
+    """将冻结 LoMa 局部特征与另一图全部 Patch 语义融合为质量场。"""
+
+    def __init__(self, local_dim: int, semantic_dim: int, heads: int = 4) -> None:
+        """创建局部特征投影、跨图注意力、联合描述子和质量头。"""
+        super().__init__()
+        if local_dim <= 0 or semantic_dim <= 0 or heads <= 0 or semantic_dim % heads:
+            raise ValueError("局部维度、语义维度和注意力头数无效")
+        self.local_projection = nn.Linear(local_dim, semantic_dim)
+        self.cross_attention = nn.MultiheadAttention(semantic_dim, heads, batch_first=True)
+        self.normalization = nn.LayerNorm(semantic_dim)
+        self.descriptor_head = nn.Linear(semantic_dim, semantic_dim)
+        self.quality_head = nn.Linear(semantic_dim, 1)
+
+    def forward(
+        self,
+        descriptor_grid_a: torch.Tensor,
+        descriptor_grid_b: torch.Tensor,
+        semantic_a: torch.Tensor,
+        semantic_b: torch.Tensor,
+        layout: PatchLayout,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """输出两图的联合稠密描述子图和双图条件化质量 logits。"""
+        _validate_local_inputs(descriptor_grid_a, descriptor_grid_b, semantic_a, semantic_b, layout)
+        points, patch_ids = layout.quality_cell_centers()
+        coordinates = torch.as_tensor(points, dtype=torch.float32, device=descriptor_grid_a.device)
+        local_a = sample_feature_map(descriptor_grid_a, coordinates, (layout.config.image_size,) * 2)
+        local_b = sample_feature_map(descriptor_grid_b, coordinates, (layout.config.image_size,) * 2)
+        ids = torch.as_tensor(patch_ids, dtype=torch.long, device=descriptor_grid_a.device)
+        joint_a = self._condition(local_a, semantic_a, semantic_b, ids)
+        joint_b = self._condition(local_b, semantic_b, semantic_a, ids)
+        rows, cols = layout.quality_grid_shape
+        descriptors_a = joint_a.transpose(0, 1).reshape(-1, rows, cols)
+        descriptors_b = joint_b.transpose(0, 1).reshape(-1, rows, cols)
+        logits_a = self.quality_head(joint_a).reshape(1, rows, cols)
+        logits_b = self.quality_head(joint_b).reshape(1, rows, cols)
+        return descriptors_a, descriptors_b, logits_a, logits_b
+
+    def _condition(
+        self,
+        local: torch.Tensor,
+        source_semantic: torch.Tensor,
+        target_semantic: torch.Tensor,
+        patch_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """让局部 Query 聚合另一图所有 Patch 语义并生成联合描述子。"""
+        query = self.normalization(self.local_projection(local) + source_semantic[0, patch_ids])
+        message, _ = self.cross_attention(query.unsqueeze(0), target_semantic, target_semantic, need_weights=False)
+        return functional.normalize(self.descriptor_head(self.normalization(query + message[0])), dim=1, eps=1e-6)
 
 
 def sample_feature_map(
@@ -202,6 +263,23 @@ def _empty_anchors() -> AnchorMatches:
     )
 
 
+def _attention_residual(
+    attention: nn.MultiheadAttention, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+) -> torch.Tensor:
+    """执行单个注意力层并以残差形式保留输入语义。"""
+    message, _ = attention(query, key, value, need_weights=False)
+    return query + message
+
+
+def _bidirectional_cross_attention(
+    attention: nn.MultiheadAttention, semantic_a: torch.Tensor, semantic_b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """以共享参数在两个方向交换 Patch 语义信息。"""
+    next_a = _attention_residual(attention, semantic_a, semantic_b, semantic_b)
+    next_b = _attention_residual(attention, semantic_b, semantic_a, semantic_a)
+    return next_a, next_b
+
+
 def _validate_anchor_budget(
     patch_count: int | None,
     minimum_per_patch: int,
@@ -231,6 +309,25 @@ def _validate_tokens(tokens_a: torch.Tensor, tokens_b: torch.Tensor) -> None:
         raise ValueError("语义 token 必须具有 [B, P, C] 形状")
     if tokens_a.shape[0] != tokens_b.shape[0] or tokens_a.shape[2] != tokens_b.shape[2]:
         raise ValueError("两图语义 token 的批量和通道维度必须一致")
+
+
+def _validate_local_inputs(
+    grid_a: torch.Tensor,
+    grid_b: torch.Tensor,
+    semantic_a: torch.Tensor,
+    semantic_b: torch.Tensor,
+    layout: PatchLayout,
+) -> None:
+    """验证局部描述子图、双图 Patch 语义与质量布局一致。"""
+    if grid_a.ndim != 3 or grid_b.ndim != 3 or grid_a.shape != grid_b.shape:
+        raise ValueError("两图局部描述子图必须具有相同的 [C, H, W] 形状")
+    _validate_tokens(semantic_a, semantic_b)
+    if semantic_a.shape[0] != 1 or semantic_a.shape[1] != layout.config.patch_count:
+        raise ValueError("局部质量编码器要求单样本完整 Patch 语义")
+    if grid_a.shape[0] != grid_b.shape[0] or grid_a.device != grid_b.device:
+        raise ValueError("两图局部描述子通道和设备必须一致")
+    if semantic_a.device != grid_a.device or semantic_b.device != grid_a.device:
+        raise ValueError("局部描述子图和 Patch 语义必须位于同一设备")
 
 
 def _validate_descriptors(descriptors_a: torch.Tensor, descriptors_b: torch.Tensor) -> None:
