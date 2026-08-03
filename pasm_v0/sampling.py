@@ -310,7 +310,13 @@ def _quality_cell_points(
     width = (x1 - x0) / cells
     height = (y1 - y0) / cells
     random = generator.random((len(selected), 2))
-    return np.column_stack((x0 + (cols + random[:, 0]) * width, y0 + (rows + random[:, 1]) * height))
+    points = np.column_stack(
+        (x0 + (cols + random[:, 0]) * width, y0 + (rows + random[:, 1]) * height)
+    )
+    upper = np.nextafter(
+        np.asarray((x1, y1), dtype=np.float32), np.asarray((x0, y0), dtype=np.float32)
+    )
+    return np.minimum(points, upper)
 
 
 def _proportional_increments(

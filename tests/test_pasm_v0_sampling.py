@@ -174,6 +174,29 @@ class PasmV0SamplingTests(unittest.TestCase):
             selected = cell_ids[patch_ids == patch_id]
             self.assertEqual(len(selected), len(np.unique(selected)))
 
+    def test_quality_sampling_near_upper_bound_stays_inside_image(self) -> None:
+        """质量格坐标转为 float32 后也必须严格小于图像右下边界。"""
+        config = PasmV0Config(
+            image_size=32,
+            patch_rows=4,
+            patch_cols=4,
+            total_points=16,
+            round_min_points=(1, 0, 0),
+            max_points_per_patch=4,
+            quality_cells_per_axis=2,
+        )
+        layout = PatchLayout(config)
+        logits = np.zeros((config.patch_count, config.quality_cell_count), dtype=np.float32)
+        logits[-1, -1] = 1000.0
+        budget = np.ones(config.patch_count, dtype=np.int64)
+        generator = _NearUpperBoundGenerator()
+
+        with patch("pasm_v0.sampling.np.random.default_rng", return_value=generator):
+            points, patch_ids, _ = sample_quality_points(layout, logits, budget, config, seed=0)
+
+        self.assertTrue(np.all(points < config.image_size))
+        np.testing.assert_array_equal(layout.patch_ids(points), patch_ids)
+
     def test_quality_sampling_retains_anchor_coordinates_exactly(self) -> None:
         """质量采样必须原样保留锚点并从同一 Patch 补足预算。"""
         config = PasmV0Config(
