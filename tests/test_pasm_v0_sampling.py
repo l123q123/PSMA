@@ -230,6 +230,27 @@ class PasmV0SamplingTests(unittest.TestCase):
         selected = points[patch_ids == 5]
         np.testing.assert_array_equal(selected, anchor)
 
+    def test_quality_sampling_is_reproducible_for_the_same_seed(self) -> None:
+        """同一质量图和随机种子必须产生相同的质量格与连续坐标。"""
+        config = PasmV0Config(
+            image_size=32,
+            patch_rows=4,
+            patch_cols=4,
+            total_points=32,
+            round_min_points=(2, 1, 0),
+            max_points_per_patch=4,
+            quality_cells_per_axis=2,
+        )
+        layout = PatchLayout(config)
+        logits = np.arange(config.patch_count * 4, dtype=np.float32).reshape(config.patch_count, 4)
+        budget = np.full(config.patch_count, 2, dtype=np.int64)
+
+        first = sample_quality_points(layout, logits, budget, config, seed=13)
+        second = sample_quality_points(layout, logits, budget, config, seed=13)
+
+        for expected, actual in zip(first, second, strict=True):
+            np.testing.assert_array_equal(expected, actual)
+
 
 class _NearUpperBoundGenerator:
     """为边界舍入测试生成无限接近一的随机数。"""

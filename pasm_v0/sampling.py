@@ -207,6 +207,9 @@ def sample_quality_points(
     sampled_ids = []
     sampled_cells = []
     probabilities = torch.softmax(logits, dim=1)
+    torch_generator = torch.Generator(device=probabilities.device)
+    if seed is not None:
+        torch_generator.manual_seed(seed)
     for patch_id, count in enumerate(allocation):
         if count == 0:
             continue
@@ -217,7 +220,9 @@ def sample_quality_points(
         if remaining > config.quality_cell_count:
             raise ValueError("单个 Patch 的非锚点数量超过可无放回采样的质量格数")
         selected = (
-            torch.multinomial(probabilities[patch_id], remaining, replacement=False).cpu().numpy()
+            torch.multinomial(
+                probabilities[patch_id], remaining, replacement=False, generator=torch_generator
+            ).cpu().numpy()
             if remaining
             else np.empty((0,), dtype=np.int64)
         )
