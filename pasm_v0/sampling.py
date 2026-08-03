@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 from .config import PasmV0Config
 
@@ -51,6 +52,35 @@ class PatchLayout:
             points.append(_uniform_points(self.bounds(patch_id), count, generator))
             patch_ids.extend([patch_id] * count)
         return np.concatenate(points, axis=0).astype(np.float32), np.asarray(patch_ids, dtype=np.int64)
+
+    @property
+    def quality_grid_shape(self) -> tuple[int, int]:
+        """返回整张图密集质量图的行列数量。"""
+        cells = self.config.quality_cells_per_axis
+        return self.config.patch_rows * cells, self.config.patch_cols * cells
+
+    def quality_cell_centers(self) -> tuple[np.ndarray, np.ndarray]:
+        """返回全图行优先排序的质量格中心与所属 Patch 索引。"""
+        rows, cols = self.quality_grid_shape
+        axis_x = (np.arange(cols, dtype=np.float32) + 0.5) * self.config.image_size / cols
+        axis_y = (np.arange(rows, dtype=np.float32) + 0.5) * self.config.image_size / rows
+        grid_y, grid_x = np.meshgrid(axis_y, axis_x, indexing="ij")
+        points = np.column_stack((grid_x.ravel(), grid_y.ravel())).astype(np.float32)
+        return points, self.patch_ids(points)
+
+    def quality_cell_ids(self, points_xy: np.ndarray) -> np.ndarray:
+        """返回每个坐标在所属 Patch 内的局部质量格索引。"""
+        points = _as_points(points_xy)
+        patch_ids = self.patch_ids(points)
+        cells = self.config.quality_cells_per_axis
+        ids = np.empty(len(points), dtype=np.int64)
+        for patch_id in np.unique(patch_ids):
+            mask = patch_ids == patch_id
+            x0, y0, x1, y1 = self.bounds(int(patch_id))
+            local_x = np.minimum(((points[mask, 0] - x0) * cells / (x1 - x0)).astype(np.int64), cells - 1)
+            local_y = np.minimum(((points[mask, 1] - y0) * cells / (y1 - y0)).astype(np.int64), cells - 1)
+            ids[mask] = local_y * cells + local_x
+        return ids
 
 
 def allocate_patch_budget(
@@ -144,6 +174,58 @@ def resample_in_patches(
     )
 
 
+def sample_quality_points(
+    layout: PatchLayout,
+    quality_logits: np.ndarray | torch.Tensor,
+    budgets: np.ndarray,
+    config: PasmV0Config,
+    seed: int | None = None,
+    anchor_points: np.ndarray | None = None,
+    anchor_patch_ids: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """按每个 Patch 的质量概率保留锚点并无放回采样连续坐标。"""
+    logits = torch.as_tensor(quality_logits, dtype=torch.float32)
+    allocation = np.asarray(budgets, dtype=np.int64).reshape(-1)
+    if logits.shape != (config.patch_count, config.quality_cell_count):
+        raise ValueError("质量 logits 必须具有每 Patch 一组局部质量格的形状")
+    if allocation.size != config.patch_count or int(allocation.sum()) != config.total_points:
+        raise ValueError("预算必须覆盖所有 Patch 且总和等于总采样预算")
+    if np.any(allocation < 0) or np.any(allocation > config.max_points_per_patch):
+        raise ValueError("Patch 预算超出允许范围")
+    anchors, anchor_ids, _ = _anchor_arrays(
+        anchor_points,
+        anchor_patch_ids,
+        None if anchor_points is None else np.ones(len(anchor_points), dtype=np.float32),
+        layout,
+        config,
+    )
+    counts = np.bincount(anchor_ids, minlength=config.patch_count)
+    if np.any(counts > allocation):
+        raise ValueError("Patch 预算不足以保留全部锚点")
+    generator = np.random.default_rng(seed)
+    sampled_points = []
+    sampled_ids = []
+    sampled_cells = []
+    probabilities = torch.softmax(logits, dim=1)
+    for patch_id, count in enumerate(allocation):
+        anchor_mask = anchor_ids == patch_id
+        kept = anchors[anchor_mask]
+        anchor_cells = layout.quality_cell_ids(kept) if len(kept) else np.empty((0,), dtype=np.int64)
+        remaining = int(count) - len(kept)
+        if remaining > config.quality_cell_count:
+            raise ValueError("单个 Patch 的非锚点数量超过可无放回采样的质量格数")
+        selected = torch.multinomial(probabilities[patch_id], remaining, replacement=False).cpu().numpy()
+        generated = _quality_cell_points(layout.bounds(patch_id), selected, config, generator)
+        sampled_points.append(np.concatenate((kept, generated), axis=0))
+        sampled_ids.extend([patch_id] * int(count))
+        sampled_cells.append(np.concatenate((anchor_cells, selected.astype(np.int64)), axis=0))
+    return (
+        np.concatenate(sampled_points, axis=0).astype(np.float32),
+        np.asarray(sampled_ids, dtype=np.int64),
+        np.concatenate(sampled_cells, axis=0).astype(np.int64),
+    )
+
+
 def _as_points(points_xy: np.ndarray) -> np.ndarray:
     """将输入转换为有限的二维浮点坐标数组。"""
     points = np.asarray(points_xy, dtype=np.float64)
@@ -201,6 +283,23 @@ def _uniform_points(
         np.asarray((x1, y1), dtype=np.float32), np.asarray((x0, y0), dtype=np.float32)
     )
     return np.minimum(points, upper)
+
+
+def _quality_cell_points(
+    bounds: tuple[float, float, float, float],
+    cell_ids: np.ndarray,
+    config: PasmV0Config,
+    generator: np.random.Generator,
+) -> np.ndarray:
+    """在指定局部质量格内部均匀生成连续坐标。"""
+    x0, y0, x1, y1 = bounds
+    cells = config.quality_cells_per_axis
+    selected = np.asarray(cell_ids, dtype=np.int64).reshape(-1)
+    rows, cols = np.divmod(selected, cells)
+    width = (x1 - x0) / cells
+    height = (y1 - y0) / cells
+    random = generator.random((len(selected), 2))
+    return np.column_stack((x0 + (cols + random[:, 0]) * width, y0 + (rows + random[:, 1]) * height))
 
 
 def _proportional_increments(

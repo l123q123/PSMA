@@ -10,6 +10,7 @@ from pasm_v0.sampling import (
     PatchLayout,
     allocate_patch_budget,
     resample_in_patches,
+    sample_quality_points,
 )
 
 
@@ -149,6 +150,58 @@ class PasmV0SamplingTests(unittest.TestCase):
         locations = np.flatnonzero(np.all(sampled == anchor[0], axis=1))
         self.assertEqual(len(locations), 1)
         self.assertEqual(int(sampled_ids[locations[0]]), 5)
+
+    def test_quality_sampling_uses_unique_cells_inside_each_patch(self) -> None:
+        """质量采样的非锚点在同一 Patch 内不能重复质量格。"""
+        config = PasmV0Config(
+            image_size=32,
+            patch_rows=4,
+            patch_cols=4,
+            total_points=32,
+            round_min_points=(2, 1, 0),
+            max_points_per_patch=4,
+            quality_cells_per_axis=2,
+        )
+        layout = PatchLayout(config)
+        logits = np.arange(config.patch_count * 4, dtype=np.float32).reshape(config.patch_count, 4)
+        budget = np.full(config.patch_count, 2, dtype=np.int64)
+
+        points, patch_ids, cell_ids = sample_quality_points(layout, logits, budget, config, seed=5)
+
+        self.assertEqual(points.shape, (32, 2))
+        np.testing.assert_array_equal(layout.patch_ids(points), patch_ids)
+        for patch_id in range(config.patch_count):
+            selected = cell_ids[patch_ids == patch_id]
+            self.assertEqual(len(selected), len(np.unique(selected)))
+
+    def test_quality_sampling_retains_anchor_coordinates_exactly(self) -> None:
+        """质量采样必须原样保留锚点并从同一 Patch 补足预算。"""
+        config = PasmV0Config(
+            image_size=32,
+            patch_rows=4,
+            patch_cols=4,
+            total_points=32,
+            round_min_points=(2, 1, 0),
+            max_points_per_patch=4,
+            quality_cells_per_axis=2,
+        )
+        layout = PatchLayout(config)
+        anchor = np.array([[9.0, 9.0]], dtype=np.float32)
+        budget = np.full(config.patch_count, 2, dtype=np.int64)
+
+        points, patch_ids, _ = sample_quality_points(
+            layout,
+            np.zeros((config.patch_count, 4), dtype=np.float32),
+            budget,
+            config,
+            seed=7,
+            anchor_points=anchor,
+            anchor_patch_ids=np.array([5], dtype=np.int64),
+        )
+
+        locations = np.flatnonzero(np.all(points == anchor[0], axis=1))
+        self.assertEqual(len(locations), 1)
+        self.assertEqual(int(patch_ids[locations[0]]), 5)
 
 
 class _NearUpperBoundGenerator:

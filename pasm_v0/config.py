@@ -12,6 +12,7 @@ class PasmV0Config:
     image_size: int = 518
     patch_rows: int = 16
     patch_cols: int = 16
+    quality_cells_per_axis: int = 8
     total_points: int = 1024
     iterations: int = 3
     round_min_points: tuple[int, ...] = (4, 1, 0)
@@ -28,7 +29,12 @@ class PasmV0Config:
 
     def __post_init__(self) -> None:
         """验证配置能产生符合 v0 约束的采样预算。"""
-        if self.image_size <= 0 or self.patch_rows <= 0 or self.patch_cols <= 0:
+        if (
+            self.image_size <= 0
+            or self.patch_rows <= 0
+            or self.patch_cols <= 0
+            or self.quality_cells_per_axis <= 0
+        ):
             raise ValueError("图像尺寸和 Patch 网格必须为正数")
         if self.total_points <= 0 or self.iterations <= 0:
             raise ValueError("点数和迭代轮次必须为正数")
@@ -62,6 +68,11 @@ class PasmV0Config:
     def patch_count(self) -> int:
         """返回管理 Patch 的总数量。"""
         return self.patch_rows * self.patch_cols
+
+    @property
+    def quality_cell_count(self) -> int:
+        """返回单个管理 Patch 内局部质量格的总数量。"""
+        return self.quality_cells_per_axis**2
 
     def minimum_for_round(self, round_index: int) -> int:
         """返回指定轮次的每 Patch 最低点数。"""
