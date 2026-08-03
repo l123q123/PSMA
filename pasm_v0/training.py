@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from torch.nn import functional as functional
 
 from .sampling import PatchLayout
+from .geometry import PairGeometry, projected_match_targets, projected_patch_support_targets
+from .pipeline import RoundRecord
 
 
 def point_match_targets(
@@ -77,6 +80,43 @@ def pasm_v0_loss(
     else:
         value_loss = zero
     return match_loss + value_loss
+
+
+def pasm_v02_loss(
+    rounds: list[RoundRecord],
+    geometry: PairGeometry,
+    layout: PatchLayout,
+    config: object,
+    teacher_a: np.ndarray | torch.Tensor,
+    teacher_b: np.ndarray | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """汇总三轮几何基础损失和双图密集质量教师损失。"""
+    if not rounds:
+        raise ValueError("v0.2 损失至少需要一轮记录")
+    support_a, support_b = projected_patch_support_targets(
+        geometry, layout, config.geometry_support_stride, config.geometry_depth_tolerance
+    )
+    base_terms = []
+    for record in rounds:
+        target_a, valid_a, target_b, valid_b = projected_match_targets(
+            record.points_a, record.points_b, geometry,
+            config.geometry_match_threshold_px, config.geometry_depth_tolerance,
+        )
+        base_terms.extend((
+            pasm_v0_loss(record.edge_weights, target_a, valid_a, record.patch_values_a, support_a),
+            pasm_v0_loss(record.edge_weights.transpose(0, 1), target_b, valid_b, record.patch_values_b, support_b),
+        ))
+    base_loss = torch.stack(base_terms).mean()
+    first = rounds[0]
+    if first.quality_logits_a is None or first.quality_logits_b is None:
+        raise ValueError("v0.2 轮次记录缺少密集质量 logits")
+    target_a = torch.as_tensor(teacher_a, dtype=first.quality_logits_a.dtype, device=first.quality_logits_a.device)
+    target_b = torch.as_tensor(teacher_b, dtype=first.quality_logits_b.dtype, device=first.quality_logits_b.device)
+    if target_a.shape != first.quality_logits_a.shape[1:] or target_b.shape != first.quality_logits_b.shape[1:]:
+        raise ValueError("质量教师图尺寸与模型质量 logits 不一致")
+    quality_loss = functional.binary_cross_entropy_with_logits(first.quality_logits_a[0], target_a)
+    quality_loss = quality_loss + functional.binary_cross_entropy_with_logits(first.quality_logits_b[0], target_b)
+    return base_loss + quality_loss, base_loss, quality_loss
 
 
 def _as_points(points_xy: np.ndarray) -> np.ndarray:

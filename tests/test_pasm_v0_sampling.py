@@ -203,6 +203,33 @@ class PasmV0SamplingTests(unittest.TestCase):
         self.assertEqual(len(locations), 1)
         self.assertEqual(int(patch_ids[locations[0]]), 5)
 
+    def test_quality_sampling_allows_patch_budget_fully_occupied_by_anchors(self) -> None:
+        """锚点恰好占满 Patch 预算时不应再请求新的质量格。"""
+        config = PasmV0Config(
+            image_size=32,
+            patch_rows=4,
+            patch_cols=4,
+            total_points=32,
+            round_min_points=(2, 1, 0),
+            max_points_per_patch=4,
+            quality_cells_per_axis=2,
+        )
+        layout = PatchLayout(config)
+        anchor = np.array([[9.0, 9.0], [10.0, 10.0]], dtype=np.float32)
+        budget = np.full(config.patch_count, 2, dtype=np.int64)
+
+        points, patch_ids, _ = sample_quality_points(
+            layout,
+            np.zeros((config.patch_count, 4), dtype=np.float32),
+            budget,
+            config,
+            anchor_points=anchor,
+            anchor_patch_ids=np.array([5, 5], dtype=np.int64),
+        )
+
+        selected = points[patch_ids == 5]
+        np.testing.assert_array_equal(selected, anchor)
+
 
 class _NearUpperBoundGenerator:
     """为边界舍入测试生成无限接近一的随机数。"""

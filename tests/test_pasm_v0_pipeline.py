@@ -7,7 +7,7 @@ import torch
 
 from pasm_v0.config import PasmV0Config
 from pasm_v0.geometry import PairGeometry
-from pasm_v0.matching import PairSemanticEncoder
+from pasm_v0.matching import PairLocalQualityEncoder, PairSemanticEncoder
 from pasm_v0.pipeline import PasmV0, RoundRecord
 from pasm_v0.sampling import PatchLayout
 from pasm_v0.train import _result_loss
@@ -25,13 +25,21 @@ class PasmV0PipelineTests(unittest.TestCase):
             total_points=32,
             round_min_points=(2, 1, 0),
             max_points_per_patch=4,
+            quality_cells_per_axis=2,
+        )
+
+    def _runner(self) -> PasmV0:
+        """创建与小型局部描述子图维度一致的 v0.2 流程。"""
+        return PasmV0(
+            PairSemanticEncoder(token_dim=8, hidden_dim=8, heads=2),
+            PairLocalQualityEncoder(local_dim=4, semantic_dim=8, heads=2),
+            self.config,
         )
 
     def test_pipeline_keeps_budget_and_patch_ownership_for_three_rounds(self) -> None:
         """三轮流程必须始终保持总点数并在最后一轮允许零预算。"""
         torch.manual_seed(3)
-        model = PairSemanticEncoder(token_dim=8, hidden_dim=8, heads=2)
-        runner = PasmV0(model, self.config)
+        runner = self._runner()
 
         result = runner.run(
             tokens_a=torch.randn(1, 16, 8),
@@ -50,6 +58,8 @@ class PasmV0PipelineTests(unittest.TestCase):
         self.assertTrue(np.all(result.rounds[2].budget_a >= 0))
         self.assertEqual(int(result.rounds[2].budget_a.sum()), 32)
         np.testing.assert_array_equal(PatchLayout(self.config).patch_ids(result.points_a), result.patch_ids_a)
+        torch.testing.assert_close(result.rounds[0].quality_logits_a, result.rounds[1].quality_logits_a)
+        torch.testing.assert_close(result.rounds[0].quality_logits_a, result.rounds[2].quality_logits_a)
 
     def test_projected_geometry_targets_drive_point_and_patch_losses(self) -> None:
         """直接投影标签应同时驱动点级和 Patch 价值损失。"""
@@ -100,7 +110,11 @@ class PasmV0PipelineTests(unittest.TestCase):
             anchor_threshold=0.0,
         )
         torch.manual_seed(9)
-        runner = PasmV0(PairSemanticEncoder(token_dim=8, hidden_dim=8, heads=2), config)
+        runner = PasmV0(
+            PairSemanticEncoder(token_dim=8, hidden_dim=8, heads=2),
+            PairLocalQualityEncoder(local_dim=4, semantic_dim=8, heads=2),
+            config,
+        )
         result = runner.run(
             tokens_a=torch.randn(1, 16, 8),
             tokens_b=torch.randn(1, 16, 8),

@@ -208,13 +208,19 @@ def sample_quality_points(
     sampled_cells = []
     probabilities = torch.softmax(logits, dim=1)
     for patch_id, count in enumerate(allocation):
+        if count == 0:
+            continue
         anchor_mask = anchor_ids == patch_id
         kept = anchors[anchor_mask]
         anchor_cells = layout.quality_cell_ids(kept) if len(kept) else np.empty((0,), dtype=np.int64)
         remaining = int(count) - len(kept)
         if remaining > config.quality_cell_count:
             raise ValueError("单个 Patch 的非锚点数量超过可无放回采样的质量格数")
-        selected = torch.multinomial(probabilities[patch_id], remaining, replacement=False).cpu().numpy()
+        selected = (
+            torch.multinomial(probabilities[patch_id], remaining, replacement=False).cpu().numpy()
+            if remaining
+            else np.empty((0,), dtype=np.int64)
+        )
         generated = _quality_cell_points(layout.bounds(patch_id), selected, config, generator)
         sampled_points.append(np.concatenate((kept, generated), axis=0))
         sampled_ids.extend([patch_id] * int(count))
