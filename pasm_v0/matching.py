@@ -33,7 +33,10 @@ class PairSemanticEncoder(nn.Module):
         self.self_attention = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
         self.cross_attention = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
         self.cross_attention_second = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
-        self.normalization = nn.LayerNorm(hidden_dim)
+        self.input_normalization = nn.LayerNorm(hidden_dim)
+        self.self_normalization = nn.LayerNorm(hidden_dim)
+        self.cross_normalization = nn.LayerNorm(hidden_dim)
+        self.cross_second_normalization = nn.LayerNorm(hidden_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
 
     def forward(
@@ -41,18 +44,20 @@ class PairSemanticEncoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """返回两图的条件化 Patch 语义和每个 Patch 的语义价值。"""
         _validate_tokens(tokens_a, tokens_b)
-        base_a = self.normalization(self.projection(tokens_a))
-        base_b = self.normalization(self.projection(tokens_b))
-        semantic_a = _attention_residual(self.self_attention, base_a, base_a, base_a)
-        semantic_b = _attention_residual(self.self_attention, base_b, base_b, base_b)
+        base_a = self.input_normalization(self.projection(tokens_a))
+        base_b = self.input_normalization(self.projection(tokens_b))
+        semantic_a = self.self_normalization(_attention_residual(self.self_attention, base_a, base_a, base_a))
+        semantic_b = self.self_normalization(_attention_residual(self.self_attention, base_b, base_b, base_b))
         semantic_a, semantic_b = _bidirectional_cross_attention(
             self.cross_attention, semantic_a, semantic_b
         )
+        semantic_a = self.cross_normalization(semantic_a)
+        semantic_b = self.cross_normalization(semantic_b)
         semantic_a, semantic_b = _bidirectional_cross_attention(
             self.cross_attention_second, semantic_a, semantic_b
         )
-        semantic_a = functional.normalize(semantic_a, dim=-1, eps=1e-6)
-        semantic_b = functional.normalize(semantic_b, dim=-1, eps=1e-6)
+        semantic_a = functional.normalize(self.cross_second_normalization(semantic_a), dim=-1, eps=1e-6)
+        semantic_b = functional.normalize(self.cross_second_normalization(semantic_b), dim=-1, eps=1e-6)
         value_a = torch.sigmoid(self.value_head(semantic_a).squeeze(-1))
         value_b = torch.sigmoid(self.value_head(semantic_b).squeeze(-1))
         return semantic_a, semantic_b, value_a, value_b

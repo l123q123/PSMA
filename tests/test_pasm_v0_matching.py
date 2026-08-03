@@ -97,6 +97,14 @@ class PasmV0MatchingTests(unittest.TestCase):
         self.assertEqual(tuple(value_b.shape), (1, 4))
         self.assertTrue(torch.all((value_a >= 0.0) & (value_a <= 1.0)))
 
+    def test_semantic_encoder_normalizes_each_attention_residual(self) -> None:
+        """自注意力和两层交叉注意力必须各有独立的残差归一化。"""
+        encoder = PairSemanticEncoder(token_dim=6, hidden_dim=8, heads=2)
+
+        self.assertIsInstance(encoder.self_normalization, torch.nn.LayerNorm)
+        self.assertIsInstance(encoder.cross_normalization, torch.nn.LayerNorm)
+        self.assertIsInstance(encoder.cross_second_normalization, torch.nn.LayerNorm)
+
     def test_local_quality_encoder_returns_dense_joint_descriptors_and_logits(self) -> None:
         """局部质量网络必须从双图语义生成可反传的密集输出。"""
         config = PasmV0Config(

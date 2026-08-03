@@ -55,7 +55,7 @@ Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0\.worktrees\v0.2-q
 
 ```powershell
 & 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.cache_quality_teacher `
-  --manifest '..\..\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
+  --manifest 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
   --loma-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth' `
   --output '.\outputs\quality_cache_4pairs' `
   --max-pairs 4 `
@@ -70,7 +70,7 @@ Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0\.worktrees\v0.2-q
 
 ```powershell
 & 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.train `
-  --manifest '..\..\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
+  --manifest 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
   --dino-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dinov2_vitl14_pretrain.pth' `
   --loma-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth' `
   --quality-cache '.\outputs\quality_cache_4pairs' `
@@ -90,7 +90,7 @@ Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0\.worktrees\v0.2-q
 
 ```powershell
 & 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.train `
-  --manifest '..\..\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
+  --manifest 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
   --dino-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dinov2_vitl14_pretrain.pth' `
   --loma-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth' `
   --quality-cache '.\outputs\quality_cache_full' `
