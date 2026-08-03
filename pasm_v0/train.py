@@ -18,25 +18,28 @@ if __package__ in {None, ""}:
     from pasm_v0.config import PasmV0Config
     from pasm_v0.data import load_manifest
     from pasm_v0.geometry import PairGeometry, load_pair_geometry, projected_match_targets, projected_patch_support_targets
-    from pasm_v0.matching import PairSemanticEncoder
+    from pasm_v0.matching import PairLocalQualityEncoder, PairSemanticEncoder
     from pasm_v0.pipeline import PasmV0, RoundRecord
+    from pasm_v0.quality_cache import load_quality_cache
     from pasm_v0.sampling import PatchLayout
-    from pasm_v0.training import pasm_v0_loss
+    from pasm_v0.training import pasm_v02_loss, pasm_v0_loss
 else:
     from .backbones import FrozenFeatureExtractor, load_resized_rgb, resolve_device
     from .config import PasmV0Config
     from .data import load_manifest
     from .geometry import PairGeometry, load_pair_geometry, projected_match_targets, projected_patch_support_targets
-    from .matching import PairSemanticEncoder
+    from .matching import PairLocalQualityEncoder, PairSemanticEncoder
     from .pipeline import PasmV0, RoundRecord
+    from .quality_cache import load_quality_cache
     from .sampling import PatchLayout
-    from .training import pasm_v0_loss
+    from .training import pasm_v02_loss, pasm_v0_loss
 
 
 def train_model(
     manifest_path: str | Path,
     dino_weights: str | Path,
     loma_weights: str | Path,
+    quality_cache_directory: str | Path,
     output_path: str | Path,
     epochs: int = 1,
     learning_rate: float = 1e-4,
@@ -47,7 +50,7 @@ def train_model(
     seed: int = 0,
     resume_path: str | Path | None = None,
 ) -> Path:
-    """利用 MegaDepth 深度和位姿训练 v0.1 的双图语义编码器和价值头。"""
+    """利用离线质量教师和 MegaDepth 几何训练 PASM v0.2。"""
     if epochs <= 0 or learning_rate <= 0.0:
         raise ValueError("训练轮数和学习率必须为正数")
     selected_device = resolve_device(device)
@@ -60,8 +63,9 @@ def train_model(
         raise ValueError("清单中没有带深度和相机信息的正图像对")
     extractor = FrozenFeatureExtractor(config, dino_weights, loma_weights, str(selected_device))
     encoder = PairSemanticEncoder(token_dim=1024, hidden_dim=hidden_dim, heads=heads).to(selected_device)
-    runner = PasmV0(encoder, config)
-    optimizer = torch.optim.Adam(encoder.parameters(), lr=learning_rate)
+    local_encoder = PairLocalQualityEncoder(local_dim=128, semantic_dim=hidden_dim, heads=heads).to(selected_device)
+    runner = PasmV0(encoder, local_encoder, config)
+    optimizer = torch.optim.Adam(list(encoder.parameters()) + list(local_encoder.parameters()), lr=learning_rate)
     layout = PatchLayout(config)
     output = Path(output_path)
     history: list[dict[str, float | int]] = []
@@ -69,16 +73,19 @@ def train_model(
     start_epoch = 0
     if resume_path is not None:
         start_epoch, history, best_loss = load_training_checkpoint(
-            resume_path, encoder, optimizer, selected_device
+            resume_path, encoder, local_encoder, optimizer, selected_device
         )
         ensure_best_checkpoint(
-            output, encoder, optimizer, config, hidden_dim, heads, history, best_loss
+            output, encoder, local_encoder, optimizer, config, hidden_dim, 128, heads, history, best_loss
         )
     if start_epoch >= epochs:
         raise ValueError("目标训练轮数必须大于检查点已完成轮数")
     for epoch in range(start_epoch, epochs):
         encoder.train()
+        local_encoder.train()
         loss_sum = 0.0
+        base_sum = 0.0
+        quality_sum = 0.0
         used_pairs = 0
         pair_progress = tqdm(pairs, total=len(pairs), unit="对", dynamic_ncols=True)
         pair_progress.set_description(f"第 {epoch + 1}/{epochs} 轮")
@@ -87,6 +94,9 @@ def train_model(
             image_a = load_resized_rgb(pair.image_a, config.image_size)
             image_b = load_resized_rgb(pair.image_b, config.image_size)
             features = extractor.extract(image_a, image_b)
+            teacher = load_quality_cache(
+                Path(quality_cache_directory) / f"{pair.pair_id}.npz", config, pair.pair_id
+            )
             result = runner.run(
                 features.tokens_a,
                 features.tokens_b,
@@ -94,11 +104,15 @@ def train_model(
                 features.descriptor_grid_b,
                 seed=seed + epoch * len(pairs) + pair_index,
             )
-            loss = _result_loss(result.rounds, geometry, layout, config)
+            loss, base_loss, quality_loss = pasm_v02_loss(
+                result.rounds, geometry, layout, config, teacher.teacher_a, teacher.teacher_b
+            )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             loss_sum += float(loss.detach())
+            base_sum += float(base_loss.detach())
+            quality_sum += float(quality_loss.detach())
             used_pairs += 1
             pair_progress.set_description(
                 format_training_progress(
@@ -108,26 +122,38 @@ def train_model(
                     len(pairs),
                     float(loss.detach()),
                     loss_sum / used_pairs,
+                    float(base_loss.detach()),
+                    float(quality_loss.detach()),
                 )
             )
         epoch_loss = loss_sum / max(used_pairs, 1)
-        history.append({"epoch": epoch + 1, "loss": epoch_loss, "pairs": used_pairs})
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "loss": epoch_loss,
+                "base_loss": base_sum / max(used_pairs, 1),
+                "quality_loss": quality_sum / max(used_pairs, 1),
+                "pairs": used_pairs,
+            }
+        )
         is_best = epoch_loss < best_loss
         if is_best:
             best_loss = epoch_loss
         save_training_checkpoint(
             _last_checkpoint_path(output),
             encoder,
+            local_encoder,
             optimizer,
             config,
             hidden_dim,
+            128,
             heads,
             history,
             best_loss,
         )
         if is_best:
             save_training_checkpoint(
-                output, encoder, optimizer, config, hidden_dim, heads, history, best_loss
+                output, encoder, local_encoder, optimizer, config, hidden_dim, 128, heads, history, best_loss
             )
     output.with_suffix(".history.json").write_text(
         json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -138,9 +164,11 @@ def train_model(
 def save_training_checkpoint(
     path: str | Path,
     encoder: PairSemanticEncoder,
+    local_encoder: PairLocalQualityEncoder,
     optimizer: torch.optim.Optimizer,
     config: PasmV0Config,
     hidden_dim: int,
+    local_dim: int,
     heads: int,
     history: list[dict[str, float | int]],
     best_loss: float,
@@ -151,6 +179,7 @@ def save_training_checkpoint(
     torch.save(
         {
             "semantic_encoder": encoder.state_dict(),
+            "local_quality_encoder": local_encoder.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": len(history),
             "history": history,
@@ -158,7 +187,9 @@ def save_training_checkpoint(
             "config": asdict(config),
             "token_dim": 1024,
             "hidden_dim": hidden_dim,
+            "local_dim": local_dim,
             "heads": heads,
+            "pasm_version": "0.2",
         },
         checkpoint,
     )
@@ -167,15 +198,22 @@ def save_training_checkpoint(
 def load_training_checkpoint(
     path: str | Path,
     encoder: PairSemanticEncoder,
+    local_encoder: PairLocalQualityEncoder,
     optimizer: torch.optim.Optimizer,
     device: torch.device | str,
 ) -> tuple[int, list[dict[str, float | int]], float]:
     """恢复检查点模型和可用优化器状态，并返回训练进度。"""
     checkpoint = Path(path)
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
-    if not isinstance(payload, dict) or "semantic_encoder" not in payload:
-        raise ValueError("续训检查点不含语义编码器权重")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("pasm_version") != "0.2"
+        or "semantic_encoder" not in payload
+        or "local_quality_encoder" not in payload
+    ):
+        raise ValueError("续训检查点不是包含局部质量网络的 PASM v0.2 权重")
     encoder.load_state_dict(payload["semantic_encoder"])
+    local_encoder.load_state_dict(payload["local_quality_encoder"])
     history = _checkpoint_history(payload, checkpoint)
     epoch = int(payload.get("epoch", history[-1]["epoch"] if history else 0))
     best_loss = float(payload.get("best_loss", min((item["loss"] for item in history), default=float("inf"))))
@@ -187,16 +225,20 @@ def load_training_checkpoint(
 def ensure_best_checkpoint(
     path: str | Path,
     encoder: PairSemanticEncoder,
+    local_encoder: PairLocalQualityEncoder,
     optimizer: torch.optim.Optimizer,
     config: PasmV0Config,
     hidden_dim: int,
+    local_dim: int,
     heads: int,
     history: list[dict[str, float | int]],
     best_loss: float,
 ) -> None:
     """在新输出路径不存在时保存恢复模型作为初始最佳模型。"""
     if not Path(path).is_file():
-        save_training_checkpoint(path, encoder, optimizer, config, hidden_dim, heads, history, best_loss)
+        save_training_checkpoint(
+            path, encoder, local_encoder, optimizer, config, hidden_dim, local_dim, heads, history, best_loss
+        )
 
 
 def _last_checkpoint_path(output: Path) -> Path:
@@ -225,11 +267,14 @@ def format_training_progress(
     pair_count: int,
     loss: float,
     average_loss: float,
+    base_loss: float,
+    quality_loss: float,
 ) -> str:
     """生成包含轮次、图像对和损失的训练进度文字。"""
     return (
         f"第 {epoch}/{total_epochs} 轮 | 图像对 {pair_index}/{pair_count} | "
-        f"当前 loss={loss:.4f} | 平均 loss={average_loss:.4f}"
+        f"当前 total={loss:.4f} | 平均 total={average_loss:.4f} | "
+        f"base={base_loss:.4f} | quality={quality_loss:.4f}"
     )
 
 
@@ -274,10 +319,11 @@ def _result_loss(
 
 def main() -> None:
     """解析训练参数并保存 PASM v0 语义编码器检查点。"""
-    parser = argparse.ArgumentParser(description="使用 MegaDepth 深度和位姿训练 PASM v0.1")
+    parser = argparse.ArgumentParser(description="使用 MegaDepth 软质量教师训练 PASM v0.2")
     parser.add_argument("--manifest", type=Path, required=True, help="MegaDepth 图像对清单")
     parser.add_argument("--dino-weights", type=Path, required=True, help="DINOv2 权重路径")
     parser.add_argument("--loma-weights", type=Path, required=True, help="LoMa 描述子权重路径")
+    parser.add_argument("--quality-cache", type=Path, required=True, help="离线质量教师缓存文件夹")
     parser.add_argument("--output", type=Path, required=True, help="输出检查点路径")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Adam 学习率")
@@ -292,6 +338,7 @@ def main() -> None:
         args.manifest,
         args.dino_weights,
         args.loma_weights,
+        args.quality_cache,
         args.output,
         args.epochs,
         args.learning_rate,

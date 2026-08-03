@@ -4,7 +4,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -16,9 +15,10 @@ from pasm_v0.infer import (
     load_runner,
     round_anchor_counts,
     save_match_visualization,
+    save_quality_map,
     save_round_point_distribution,
 )
-from pasm_v0.matching import PairSemanticEncoder
+from pasm_v0.matching import PairLocalQualityEncoder, PairSemanticEncoder
 from pasm_v0.pipeline import RoundRecord
 from pasm_v0.train import format_training_device, format_training_progress
 from pasm_v0.visualize_quality_teacher import (
@@ -92,18 +92,22 @@ class PasmV0CliTests(unittest.TestCase):
             self.assertTrue(matches_path.is_file())
             self.assertIn("sample", summary_path.read_text(encoding="utf-8"))
 
-    def test_training_progress_includes_epoch_pair_and_losses(self) -> None:
-        """训练进度文字应同时显示轮次、图像对和两种损失。"""
-        text = format_training_progress(3, 10, 47, 96, 0.625, 0.5)
+    def test_training_progress_includes_total_base_and_quality_losses(self) -> None:
+        """训练进度文字应同时显示 total、base 和 quality 三种损失。"""
+        text = format_training_progress(3, 10, 47, 96, 0.625, 0.5, 0.4, 0.225)
 
-        self.assertEqual(text, "第 3/10 轮 | 图像对 47/96 | 当前 loss=0.6250 | 平均 loss=0.5000")
+        self.assertEqual(
+            text,
+            "第 3/10 轮 | 图像对 47/96 | 当前 total=0.6250 | 平均 total=0.5000 | "
+            "base=0.4000 | quality=0.2250",
+        )
 
     def test_training_device_text_identifies_selected_device(self) -> None:
         """训练启动信息应明确显示实际使用的设备。"""
         self.assertEqual(format_training_device("cuda"), "训练设备：cuda")
 
-    def test_training_command_exposes_resume_argument(self) -> None:
-        """训练命令应提供从已有检查点继续训练的参数。"""
+    def test_training_command_exposes_quality_cache_and_resume_arguments(self) -> None:
+        """v0.2 训练命令必须提供教师缓存和续训参数。"""
         script = Path(__file__).parents[1] / "pasm_v0" / "train.py"
 
         result = subprocess.run(
@@ -112,6 +116,7 @@ class PasmV0CliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--resume", result.stdout)
+        self.assertIn("--quality-cache", result.stdout)
 
     def test_inference_visualizations_save_point_and_match_images(self) -> None:
         """推理可视化应保存一张轮次点图和一张最终连线图。"""
@@ -123,11 +128,14 @@ class PasmV0CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             point_image = Path(directory) / "round_1_points.png"
             match_image = Path(directory) / "matches.png"
+            quality_image = Path(directory) / "quality_a.png"
             save_round_point_distribution(point_image, image_a, image_b, points_a, points_b, 1)
             save_match_visualization(match_image, image_a, image_b, points_a, points_b)
+            save_quality_map(quality_image, image_a, np.zeros((4, 4), dtype=np.float32))
 
             self.assertTrue(point_image.is_file())
             self.assertTrue(match_image.is_file())
+            self.assertTrue(quality_image.is_file())
 
     def test_experiment_output_directory_uses_fixed_result_names(self) -> None:
         """一次推理的所有结果必须放入指定实验目录，并使用固定文件名。"""
@@ -142,6 +150,8 @@ class PasmV0CliTests(unittest.TestCase):
             ])
             self.assertEqual(paths.matches.name, "matches.png")
             self.assertEqual(paths.high_confidence_matches.name, "high_confidence_matches.png")
+            self.assertEqual(paths.quality_maps[0].name, "quality_a.png")
+            self.assertEqual(paths.quality_maps[1].name, "quality_b.png")
             self.assertTrue(paths.result.parent.is_dir())
 
     def test_experiment_output_directory_rejects_npz_file_path(self) -> None:
@@ -171,53 +181,24 @@ class PasmV0CliTests(unittest.TestCase):
         np.testing.assert_array_equal(counts_a, np.array([[0, 1, 0, 0]], dtype=np.int64))
         np.testing.assert_array_equal(counts_b, np.array([[0, 0, 1, 0]], dtype=np.int64))
 
-    def test_legacy_inference_checkpoint_uses_linear_budget_allocation(self) -> None:
-        """缺少新字段的旧检查点推理时必须保持原有线性预算分配。"""
+    def test_v02_inference_rejects_checkpoint_without_local_quality_encoder(self) -> None:
+        """v0.2 推理必须拒绝不含局部质量网络的旧检查点。"""
         encoder = PairSemanticEncoder(token_dim=4, hidden_dim=4, heads=2)
-        config = asdict(PasmV0Config())
-        config.update({"anchor_threshold": 0.02, "jitter_ratio": 0.2})
-        config.pop("budget_score_power", None)
 
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "legacy.pt"
             torch.save(
                 {
                     "semantic_encoder": encoder.state_dict(),
-                    "config": config,
+                    "config": {},
                     "token_dim": 4,
                     "hidden_dim": 4,
                     "heads": 2,
                 },
                 checkpoint,
             )
-            runner = load_runner(checkpoint, torch.device("cpu"))
-
-        self.assertEqual(runner.config.budget_score_power, 1.0)
-
-    def test_inference_can_enable_strengthened_sampling_for_legacy_checkpoint(self) -> None:
-        """旧检查点应能仅在推理时覆盖为强化采样配置。"""
-        encoder = PairSemanticEncoder(token_dim=4, hidden_dim=4, heads=2)
-        config = asdict(PasmV0Config())
-        config.update({"anchor_threshold": 0.02, "jitter_ratio": 0.2})
-        config.pop("budget_score_power", None)
-
-        with tempfile.TemporaryDirectory() as directory:
-            checkpoint = Path(directory) / "legacy.pt"
-            torch.save(
-                {
-                    "semantic_encoder": encoder.state_dict(),
-                    "config": config,
-                    "token_dim": 4,
-                    "hidden_dim": 4,
-                    "heads": 2,
-                },
-                checkpoint,
-            )
-            runner = load_runner(checkpoint, torch.device("cpu"), strengthened_sampling=True)
-
-        self.assertEqual(runner.config.anchor_threshold, 0.05)
-        self.assertEqual(runner.config.budget_score_power, 2.0)
-        self.assertEqual(runner.config.jitter_ratio, 0.35)
+            with self.assertRaises(ValueError):
+                load_runner(checkpoint, torch.device("cpu"))
 
 
 if __name__ == "__main__":

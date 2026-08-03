@@ -14,12 +14,12 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from pasm_v0.backbones import FrozenFeatureExtractor, load_resized_rgb, resolve_device
     from pasm_v0.config import PasmV0Config
-    from pasm_v0.matching import PairSemanticEncoder, mutual_match_indices
+    from pasm_v0.matching import PairLocalQualityEncoder, PairSemanticEncoder, mutual_match_indices
     from pasm_v0.pipeline import PasmV0, RoundRecord
 else:
     from .backbones import FrozenFeatureExtractor, load_resized_rgb, resolve_device
     from .config import PasmV0Config
-    from .matching import PairSemanticEncoder, mutual_match_indices
+    from .matching import PairLocalQualityEncoder, PairSemanticEncoder, mutual_match_indices
     from .pipeline import PasmV0, RoundRecord
 
 
@@ -31,29 +31,30 @@ class ExperimentOutputPaths:
     round_points: tuple[Path, ...]
     matches: Path
     high_confidence_matches: Path
+    quality_maps: tuple[Path, Path]
 
 
-def load_runner(
-    checkpoint_path: str | Path, device: torch.device, strengthened_sampling: bool = False
-) -> PasmV0:
-    """从训练检查点恢复 v0 配置和双图语义编码器。"""
+def load_runner(checkpoint_path: str | Path, device: torch.device) -> PasmV0:
+    """从 v0.2 检查点恢复双图语义和局部质量编码器。"""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if (
+        not isinstance(checkpoint, dict)
+        or checkpoint.get("pasm_version") != "0.2"
+        or "local_quality_encoder" not in checkpoint
+    ):
+        raise ValueError("推理检查点不是包含局部质量网络的 PASM v0.2 权重")
     config_data = dict(checkpoint["config"])
-    config_data.setdefault("budget_score_power", 1.0)
-    if strengthened_sampling:
-        strengthened = PasmV0Config()
-        config_data.update(
-            anchor_threshold=strengthened.anchor_threshold,
-            budget_score_power=strengthened.budget_score_power,
-            jitter_ratio=strengthened.jitter_ratio,
-        )
     config_data["round_min_points"] = tuple(config_data["round_min_points"])
     config = PasmV0Config(**config_data)
     encoder = PairSemanticEncoder(
         int(checkpoint["token_dim"]), int(checkpoint["hidden_dim"]), int(checkpoint["heads"])
     ).to(device)
     encoder.load_state_dict(checkpoint["semantic_encoder"], strict=True)
-    return PasmV0(encoder.eval(), config)
+    local = PairLocalQualityEncoder(
+        int(checkpoint["local_dim"]), int(checkpoint["hidden_dim"]), int(checkpoint["heads"])
+    ).to(device)
+    local.load_state_dict(checkpoint["local_quality_encoder"], strict=True)
+    return PasmV0(encoder.eval(), local.eval(), config)
 
 
 def run_inference(
@@ -65,11 +66,10 @@ def run_inference(
     output_directory: str | Path,
     device: str = "auto",
     seed: int | None = 0,
-    strengthened_sampling: bool = False,
 ) -> Path:
     """运行 PASM v0 并将所有结果保存到指定实验目录。"""
     selected_device = resolve_device(device)
-    runner = load_runner(checkpoint, selected_device, strengthened_sampling)
+    runner = load_runner(checkpoint, selected_device)
     extractor = FrozenFeatureExtractor(runner.config, dino_weights, loma_weights, device=str(selected_device))
     image_a = load_resized_rgb(image_a_path, runner.config.image_size)
     image_b = load_resized_rgb(image_b_path, runner.config.image_size)
@@ -101,6 +101,10 @@ def run_inference(
         round_points_b=np.stack([record.points_b for record in result.rounds]),
         round_anchor_count_a=anchor_count_a,
         round_anchor_count_b=anchor_count_b,
+        quality_logits_a=result.rounds[0].quality_logits_a.detach().cpu().numpy(),
+        quality_logits_b=result.rounds[0].quality_logits_b.detach().cpu().numpy(),
+        round_quality_cell_ids_a=np.stack([record.quality_cell_ids_a for record in result.rounds]),
+        round_quality_cell_ids_b=np.stack([record.quality_cell_ids_b for record in result.rounds]),
         config=np.asarray(str(asdict(runner.config))),
     )
     for round_index, (record, point_path) in enumerate(zip(result.rounds, output.round_points, strict=True), start=1):
@@ -112,6 +116,8 @@ def run_inference(
             record.points_b,
             round_index,
         )
+    save_quality_map(output.quality_maps[0], image_a, result.rounds[0].quality_logits_a[0])
+    save_quality_map(output.quality_maps[1], image_b, result.rounds[0].quality_logits_b[0])
     save_match_visualization(
         output.matches,
         image_a,
@@ -141,6 +147,7 @@ def experiment_output_paths(directory: str | Path) -> ExperimentOutputPaths:
         round_points=tuple(output / f"round_{index}_points.png" for index in range(1, 4)),
         matches=output / "matches.png",
         high_confidence_matches=output / "high_confidence_matches.png",
+        quality_maps=(output / "quality_a.png", output / "quality_b.png"),
     )
 
 
@@ -200,6 +207,24 @@ def save_match_visualization(
     canvas.save(output_path)
 
 
+def save_quality_map(output_path: str | Path, image: np.ndarray, logits: np.ndarray) -> None:
+    """将双图条件化质量 logits 以红黄热力图叠加到输入图像。"""
+    from PIL import Image
+
+    source = np.asarray(image, dtype=np.float32)
+    values = torch.sigmoid(torch.as_tensor(logits, dtype=torch.float32)).cpu().numpy()
+    if source.ndim != 3 or source.shape[0] != 3 or values.ndim != 2:
+        raise ValueError("质量图可视化需要 CHW 图像和二维 logits")
+    heat = Image.fromarray(np.clip(values * 255.0, 0.0, 255.0).astype(np.uint8)).resize(
+        (source.shape[2], source.shape[1]), Image.Resampling.BILINEAR
+    )
+    score = np.asarray(heat, dtype=np.float32) / 255.0
+    overlay = source.transpose(1, 2, 0).copy()
+    color = np.stack((np.ones_like(score), score, np.zeros_like(score)), axis=2)
+    overlay = overlay * 0.55 + color * (0.45 * score[:, :, None])
+    Image.fromarray(np.clip(overlay * 255.0, 0.0, 255.0).astype(np.uint8), mode="RGB").save(output_path)
+
+
 def _side_by_side_image(image_a: np.ndarray, image_b: np.ndarray):
     """将两张 CHW RGB 图像转换为同高的左右拼接 Pillow 图像。"""
     from PIL import Image
@@ -226,19 +251,16 @@ def _to_pillow_image(image: np.ndarray):
 
 
 def main() -> None:
-    """解析命令行参数并执行 PASM v0 两图推理。"""
-    parser = argparse.ArgumentParser(description="运行 PASM v0 的三轮点级联合重采样")
+    """解析命令行参数并执行 PASM v0.2 两图推理。"""
+    parser = argparse.ArgumentParser(description="运行 PASM v0.2 的质量驱动三轮点级重采样")
     parser.add_argument("--image-a", type=Path, required=True, help="第一张输入图像")
     parser.add_argument("--image-b", type=Path, required=True, help="第二张输入图像")
     parser.add_argument("--dino-weights", type=Path, required=True, help="DINOv2 权重路径")
     parser.add_argument("--loma-weights", type=Path, required=True, help="LoMa 描述子权重路径")
-    parser.add_argument("--checkpoint", type=Path, required=True, help="训练得到的 PASM v0 检查点")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="训练得到的 PASM v0.2 检查点")
     parser.add_argument("--output", type=Path, required=True, help="本次实验的输出文件夹")
     parser.add_argument("--device", default="auto", help="auto、cuda 或 cpu")
     parser.add_argument("--seed", type=int, default=0, help="采样随机种子")
-    parser.add_argument(
-        "--strengthened-sampling", action="store_true", help="使用当前强化采样参数，不修改检查点权重"
-    )
     args = parser.parse_args()
     output = run_inference(
         args.image_a,
@@ -249,7 +271,6 @@ def main() -> None:
         args.output,
         args.device,
         args.seed,
-        args.strengthened_sampling,
     )
     print(output)
 
