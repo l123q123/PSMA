@@ -222,12 +222,12 @@ def run_static_inference(
     runner = load_runner(checkpoint, selected_device)
     image_a = load_resized_rgb(image_a_path, runner.config.image_size)
     image_b = load_resized_rgb(image_b_path, runner.config.image_size)
-    tokens_a, tokens_b = _extract_patch_tokens(
-        image_a, image_b, dino_weights, runner.config, selected_device
-    )
-    with torch.inference_mode():
-        _, _, values_a, values_b = runner.semantic_encoder(tokens_a, tokens_b)
     if mode == "pasm_dad":
+        tokens_a, tokens_b = _extract_patch_tokens(
+            image_a, image_b, dino_weights, runner.config, selected_device
+        )
+        with torch.inference_mode():
+            _, _, values_a, values_b = runner.semantic_encoder(tokens_a, tokens_b)
         budget_a = allocate_patch_budget(
             values_a[0].detach().cpu().numpy(), runner.config, round_index=2
         )

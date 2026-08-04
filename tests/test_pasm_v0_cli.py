@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -15,12 +16,13 @@ from pasm_v0.infer import (
     experiment_output_paths,
     load_runner,
     round_anchor_counts,
+    run_static_inference,
     save_match_visualization,
     save_round_point_distribution,
     static_experiment_output_paths,
 )
 from pasm_v0.matching import PairSemanticEncoder
-from pasm_v0.pipeline import RoundRecord
+from pasm_v0.pipeline import PasmV0, RoundRecord
 from pasm_v0.train import format_training_device, format_training_progress
 from pasm_v0.visualize_quality_teacher import (
     build_argument_parser,
@@ -177,6 +179,50 @@ class PasmV0CliTests(unittest.TestCase):
             self.assertEqual(paths.matches.name, "matches.png")
             self.assertEqual(paths.high_confidence_matches.name, "high_confidence_matches.png")
             self.assertTrue(paths.result.parent.is_dir())
+
+    def test_dad_global_skips_pasm_semantic_budget_extraction(self) -> None:
+        """全局 DaD 基线不应加载 DINO 或执行 PASM 语义预算。"""
+        runner = PasmV0(PairSemanticEncoder(token_dim=4, hidden_dim=4, heads=2), PasmV0Config())
+        image = np.zeros((3, 16, 16), dtype=np.float32)
+        points = np.array([[1.5, 1.5], [2.5, 2.5]], dtype=np.float32)
+        detector = MagicMock()
+        detector.detect.return_value = object()
+        matcher = MagicMock()
+        matcher.match.return_value = (
+            np.array([0, 1], dtype=np.int64),
+            np.array([0, 1], dtype=np.int64),
+            np.array([0.9, 0.8], dtype=np.float32),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("pasm_v0.infer.resolve_device", return_value=torch.device("cpu")),
+                patch("pasm_v0.infer.load_runner", return_value=runner),
+                patch("pasm_v0.infer.load_resized_rgb", side_effect=[image, image]),
+                patch(
+                    "pasm_v0.infer._extract_patch_tokens",
+                    side_effect=AssertionError("dad_global 不应提取 PASM token"),
+                ),
+                patch("pasm_v0.infer.FrozenDaDDetector", return_value=detector),
+                patch(
+                    "pasm_v0.infer.select_global_dad_points",
+                    side_effect=[(points, np.array([0.7, 0.6])), (points, np.array([0.7, 0.6]))],
+                ),
+                patch("pasm_v0.infer.FrozenLoMaMatcher", return_value=matcher),
+            ):
+                result = run_static_inference(
+                    "image_a.jpg",
+                    "image_b.jpg",
+                    "dino.pth",
+                    "loma.pth",
+                    "checkpoint.pt",
+                    Path(directory) / "dad_global",
+                    "dad_global",
+                    "dad.pth",
+                    "cpu",
+                )
+            self.assertTrue(result.is_file())
+
 
     def test_round_anchor_counts_follow_recorded_patch_ids(self) -> None:
         """推理输出统计应按锚点所在 Patch 记录每轮数量。"""
