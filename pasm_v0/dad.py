@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
+import torch
 
 from .sampling import PatchLayout
 
@@ -16,6 +19,76 @@ class DaDDetections:
     dense_scores: np.ndarray
     nms_points: np.ndarray
     nms_scores: np.ndarray
+
+
+class FrozenDaDDetector:
+    """从本地权重加载冻结 DaD，并输出稠密分数和全部 NMS 候选。"""
+
+    def __init__(self, weights_path: str | Path, image_size: int, device: str | torch.device) -> None:
+        """构建禁止网络下载、输入尺寸固定的 DaD 检测器。"""
+        self.weights_path = Path(weights_path)
+        if not self.weights_path.is_file():
+            raise FileNotFoundError(self.weights_path)
+        if image_size <= 0:
+            raise ValueError("DaD 输入图像尺寸必须为正数")
+        self.image_size = image_size
+        self.device = torch.device(device)
+        from loma.detector import dad as dad_module
+
+        dad_module.device = self.device
+        state = torch.load(self.weights_path, map_location="cpu", weights_only=False)
+        with patch("torch.hub.load_state_dict_from_url", return_value=state):
+            self.model = dad_module.DaD(
+                dad_module.DaD.Cfg(
+                    compile=False,
+                    resize=image_size,
+                    keep_aspect_ratio=False,
+                    nms_size=3,
+                    increase_coverage=False,
+                    subpixel=True,
+                )
+            )
+        self.model.to(self.device).eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+
+    @torch.inference_mode()
+    def detect(self, image: np.ndarray | torch.Tensor) -> DaDDetections:
+        """对一张固定尺寸图像提取 DaD 稠密概率和全部原生 NMS 峰。"""
+        from loma.detector.dad import sample_keypoints
+
+        tensor = _image_tensor(image, self.image_size, self.device)
+        scoremap = self.model.forward_impl(tensor)
+        batch, channels, height, width = scoremap.shape
+        if batch != 1 or channels != 1 or (height, width) != (self.image_size, self.image_size):
+            raise ValueError("DaD 输出尺寸与输入图像尺寸不一致")
+        dense_scores = (
+            scoremap.reshape(batch, channels * height * width)
+            .softmax(dim=-1)
+            .reshape(batch, channels, height * width)
+            .sum(dim=1)
+            .reshape(batch, height, width)
+        )
+        normalized_points, nms_scores = sample_keypoints(
+            dense_scores,
+            num_samples=height * width,
+            use_nms=True,
+            nms_size=3,
+            sample_topk=True,
+            increase_coverage=False,
+            return_probs=True,
+            subpixel=True,
+            scoremap=scoremap[:, 0],
+            subpixel_temp=self.model.subpixel_temp,
+        )
+        keep = nms_scores[0] > 0.0
+        points = _normalized_to_pixels(normalized_points[0][keep], self.image_size)
+        scores = nms_scores[0][keep].float().cpu().numpy().astype(np.float32)
+        return DaDDetections(
+            dense_scores=dense_scores[0].float().cpu().numpy().astype(np.float32),
+            nms_points=points,
+            nms_scores=scores,
+        )
 
 
 def select_patch_budgeted_points(
@@ -174,3 +247,29 @@ def _validate_patch_selection(
         raise ValueError("DaD Patch 实际点数必须等于分配预算")
     if not np.array_equal(layout.patch_ids(points), patch_ids):
         raise ValueError("DaD Patch 选点必须位于声明 Patch 内")
+
+
+def _image_tensor(
+    image: np.ndarray | torch.Tensor, image_size: int, device: torch.device
+) -> torch.Tensor:
+    """验证并将 CHW RGB 图像转换为 DaD 所需的单样本张量。"""
+    tensor = torch.as_tensor(image, dtype=torch.float32, device=device)
+    if tensor.ndim == 3:
+        tensor = tensor[None]
+    if (
+        image_size <= 0
+        or tensor.shape != (1, 3, image_size, image_size)
+        or not torch.isfinite(tensor).all()
+    ):
+        raise ValueError("DaD 输入图像必须是有限的 [3, S, S] 或 [1, 3, S, S] 数组")
+    return tensor
+
+
+def _normalized_to_pixels(normalized_points: torch.Tensor, image_size: int) -> np.ndarray:
+    """将 DaD 归一化亚像素点转换并裁剪到图像内的像素坐标。"""
+    points = torch.as_tensor(normalized_points, dtype=torch.float32)
+    if image_size <= 0 or points.ndim != 2 or points.shape[1:] != (2,) or not torch.isfinite(points).all():
+        raise ValueError("DaD 归一化点必须是形状为 [N, 2] 的有限数组")
+    upper = float(np.nextafter(np.float32(image_size), np.float32(0.0)))
+    pixels = torch.clamp((points + 1.0) * (image_size / 2.0), min=0.0, max=upper)
+    return pixels.cpu().numpy().astype(np.float32)
