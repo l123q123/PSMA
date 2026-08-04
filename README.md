@@ -2,6 +2,35 @@
 
 本项目实现当前确认的 PASM 第一版：每张图每轮固定 1024 个实际采样点，所有点全局匹配；Patch 只管理采样预算和 Patch 内重采样，不构造 Patch 对。
 
+## v0.3：静态 Patch 预算与 DaD 局部选点
+
+v0.3 取消三轮锚点、反馈和重采样，改为一次静态推理：PASM 双图语义价值头只给 `16×16` 管理 Patch 分配 `0～20` 点的预算；冻结 DaD 在各自 Patch 内按原生 `3×3` NMS 分数选择具体坐标；最后把两图各 `1024` 个点交给完整冻结 LoMa-B128 做描述和匹配。
+
+两个模式使用同一组图像、同一个 PASM v0.2 检查点、同一个 DaD 和完整 LoMa 匹配器：
+
+- `dad_global`：DaD 在整图全局选 1024 点，不使用 PASM Patch 预算，是单图检测基线。
+- `pasm_dad`：PASM 根据两图联合语义分配 Patch 预算，再由 DaD 在对应 Patch 内选点，是本版本的联合预算方法。
+
+这两个模式都只运行一次选点和一次 LoMa 匹配，因而可以直接比较“联合 Patch 预算”本身的作用。v0.3 不需要重新训练，复用已有的 PASM 检查点；完整 LoMa-B128 使用 `dedode_b` 的 128 维局部描述子和 256 维匹配 Transformer，并依赖本地 DINOv2 权重。
+
+### v0.3 推理命令
+
+```powershell
+Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0\.worktrees\v0.3-pasm-dad-static'
+& 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.infer `
+  --image-a 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\extracted\0285\0\3297850508_67cf0aae1c_b.jpg.jpg' `
+  --image-b 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\extracted\0285\0\3390973770_759850a96e_o.jpg.jpg' `
+  --dino-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dinov2_vitl14_pretrain.pth' `
+  --loma-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth' `
+  --dad-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dad.pth' `
+  --checkpoint 'D:\研0新方向\论文调研\Loma实验\PASM-v0\outputs\pasm_v0_1024\main_6px_1024_60.pt' `
+  --output '.\outputs\v0.3\pasm_dad_0285' `
+  --device cuda `
+  --mode pasm_dad
+```
+
+把最后的 `--mode pasm_dad` 改成 `--mode dad_global` 即可运行单图 DaD 基线。每次实验目录包含 `result.npz`、`points.png`、`matches.png` 和 `high_confidence_matches.png`。`result.npz` 中的 `selected_points_a/b` 必须各有 1024 个点；`pasm_dad` 还保存 `patch_budget_a/b` 与 `selected_patch_ids_a/b`，可直接验证每个 Patch 的实际点数。
+
 ## 当前流程
 
 1. 将图像缩放为 `518×518`，建立 `16×16` 管理 Patch 网格。

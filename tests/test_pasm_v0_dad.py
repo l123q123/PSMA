@@ -47,8 +47,8 @@ class DaDSelectionTests(unittest.TestCase):
         dense_scores[1, 6] = 0.90
         detections = DaDDetections(
             dense_scores=dense_scores,
-            nms_points=np.array([[2.25, 2.5], [7.2, 7.3]], dtype=np.float32),
-            nms_scores=np.array([0.10, 0.05], dtype=np.float32),
+            nms_points=np.array([[2.25, 2.5], [1.2, 6.3], [7.2, 7.3]], dtype=np.float32),
+            nms_scores=np.array([0.10, 0.08, 0.05], dtype=np.float32),
         )
         budgets = np.array([2, 1, 0, 1], dtype=np.int64)
 

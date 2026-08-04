@@ -12,15 +12,33 @@ import torch
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from pasm_v0.backbones import FrozenFeatureExtractor, load_resized_rgb, resolve_device
+    from pasm_v0.backbones import (
+        DINOv2PatchEncoder,
+        FrozenFeatureExtractor,
+        load_resized_rgb,
+        pool_dino_tokens,
+        resolve_device,
+    )
     from pasm_v0.config import PasmV0Config
     from pasm_v0.matching import PairSemanticEncoder, mutual_match_indices
     from pasm_v0.pipeline import PasmV0, RoundRecord
+    from pasm_v0.sampling import allocate_patch_budget
+    from pasm_v0.dad import FrozenDaDDetector, select_global_dad_points, select_patch_budgeted_points
+    from pasm_v0.loma_matcher import FrozenLoMaMatcher
 else:
-    from .backbones import FrozenFeatureExtractor, load_resized_rgb, resolve_device
+    from .backbones import (
+        DINOv2PatchEncoder,
+        FrozenFeatureExtractor,
+        load_resized_rgb,
+        pool_dino_tokens,
+        resolve_device,
+    )
     from .config import PasmV0Config
     from .matching import PairSemanticEncoder, mutual_match_indices
     from .pipeline import PasmV0, RoundRecord
+    from .sampling import allocate_patch_budget
+    from .dad import FrozenDaDDetector, select_global_dad_points, select_patch_budgeted_points
+    from .loma_matcher import FrozenLoMaMatcher
 
 
 @dataclass(frozen=True)
@@ -29,6 +47,16 @@ class ExperimentOutputPaths:
 
     result: Path
     round_points: tuple[Path, ...]
+    matches: Path
+    high_confidence_matches: Path
+
+
+@dataclass(frozen=True)
+class StaticExperimentOutputPaths:
+    """保存一次 v0.3 静态推理实验的固定输出文件路径。"""
+
+    result: Path
+    points: Path
     matches: Path
     high_confidence_matches: Path
 
@@ -66,8 +94,24 @@ def run_inference(
     device: str = "auto",
     seed: int | None = 0,
     strengthened_sampling: bool = False,
+    mode: str = "iterative_loma",
+    dad_weights: str | Path | None = None,
 ) -> Path:
-    """运行 PASM v0 并将所有结果保存到指定实验目录。"""
+    """运行指定 PASM 推理模式并将结果保存到对应实验目录。"""
+    if mode in {"dad_global", "pasm_dad"}:
+        return run_static_inference(
+            image_a_path,
+            image_b_path,
+            dino_weights,
+            loma_weights,
+            checkpoint,
+            output_directory,
+            mode,
+            dad_weights,
+            device,
+        )
+    if mode not in {"iterative_loma", "static_semantic"}:
+        raise ValueError(f"不支持的推理模式：{mode}")
     selected_device = resolve_device(device)
     runner = load_runner(checkpoint, selected_device, strengthened_sampling)
     extractor = FrozenFeatureExtractor(runner.config, dino_weights, loma_weights, device=str(selected_device))
@@ -144,6 +188,130 @@ def experiment_output_paths(directory: str | Path) -> ExperimentOutputPaths:
     )
 
 
+def static_experiment_output_paths(directory: str | Path) -> StaticExperimentOutputPaths:
+    """创建 v0.3 静态实验目录并返回固定输出路径。"""
+    output = Path(directory)
+    if output.suffix:
+        raise ValueError("--output 必须是实验输出文件夹，不能是文件路径")
+    output.mkdir(parents=True, exist_ok=True)
+    return StaticExperimentOutputPaths(
+        result=output / "result.npz",
+        points=output / "points.png",
+        matches=output / "matches.png",
+        high_confidence_matches=output / "high_confidence_matches.png",
+    )
+
+
+def run_static_inference(
+    image_a_path: str | Path,
+    image_b_path: str | Path,
+    dino_weights: str | Path,
+    loma_weights: str | Path,
+    checkpoint: str | Path,
+    output_directory: str | Path,
+    mode: str,
+    dad_weights: str | Path | None,
+    device: str,
+) -> Path:
+    """运行单轮 dad_global 或 pasm_dad 推理并保存全部静态结果。"""
+    if mode not in {"dad_global", "pasm_dad"}:
+        raise ValueError(f"静态推理模式无效：{mode}")
+    if dad_weights is None:
+        raise ValueError("dad_global 和 pasm_dad 必须提供 --dad-weights")
+    selected_device = resolve_device(device)
+    runner = load_runner(checkpoint, selected_device)
+    image_a = load_resized_rgb(image_a_path, runner.config.image_size)
+    image_b = load_resized_rgb(image_b_path, runner.config.image_size)
+    tokens_a, tokens_b = _extract_patch_tokens(
+        image_a, image_b, dino_weights, runner.config, selected_device
+    )
+    with torch.inference_mode():
+        _, _, values_a, values_b = runner.semantic_encoder(tokens_a, tokens_b)
+    if mode == "pasm_dad":
+        budget_a = allocate_patch_budget(
+            values_a[0].detach().cpu().numpy(), runner.config, round_index=2
+        )
+        budget_b = allocate_patch_budget(
+            values_b[0].detach().cpu().numpy(), runner.config, round_index=2
+        )
+    detector = FrozenDaDDetector(dad_weights, runner.config.image_size, selected_device)
+    detections_a = detector.detect(image_a)
+    detections_b = detector.detect(image_b)
+    if mode == "pasm_dad":
+        points_a, patch_ids_a, dad_scores_a = select_patch_budgeted_points(
+            detections_a, runner.layout, budget_a
+        )
+        points_b, patch_ids_b, dad_scores_b = select_patch_budgeted_points(
+            detections_b, runner.layout, budget_b
+        )
+    else:
+        points_a, dad_scores_a = select_global_dad_points(
+            detections_a, runner.config.image_size, runner.config.total_points
+        )
+        points_b, dad_scores_b = select_global_dad_points(
+            detections_b, runner.config.image_size, runner.config.total_points
+        )
+        patch_ids_a = runner.layout.patch_ids(points_a)
+        patch_ids_b = runner.layout.patch_ids(points_b)
+        budget_a = np.bincount(patch_ids_a, minlength=runner.config.patch_count).astype(np.int64)
+        budget_b = np.bincount(patch_ids_b, minlength=runner.config.patch_count).astype(np.int64)
+    del detector, detections_a, detections_b
+    if selected_device.type == "cuda":
+        torch.cuda.empty_cache()
+    matcher = FrozenLoMaMatcher(loma_weights, dad_weights, dino_weights, selected_device)
+    indices_a, indices_b, confidence = matcher.match(image_a, points_a, image_b, points_b)
+    output = static_experiment_output_paths(output_directory)
+    matched_a = points_a[indices_a]
+    matched_b = points_b[indices_b]
+    np.savez_compressed(
+        output.result,
+        mode=np.asarray(mode),
+        selected_points_a=points_a,
+        selected_points_b=points_b,
+        selected_patch_ids_a=patch_ids_a,
+        selected_patch_ids_b=patch_ids_b,
+        selected_dad_scores_a=dad_scores_a,
+        selected_dad_scores_b=dad_scores_b,
+        patch_budget_a=budget_a,
+        patch_budget_b=budget_b,
+        keypoints_a=matched_a,
+        keypoints_b=matched_b,
+        confidence=confidence,
+        config=np.asarray(str(asdict(runner.config))),
+    )
+    save_static_point_distribution(output.points, image_a, image_b, points_a, points_b, mode)
+    save_match_visualization(output.matches, image_a, image_b, matched_a, matched_b)
+    high_confidence = confidence >= 0.6
+    save_match_visualization(
+        output.high_confidence_matches,
+        image_a,
+        image_b,
+        matched_a[high_confidence],
+        matched_b[high_confidence],
+    )
+    return output.result
+
+
+def _extract_patch_tokens(
+    image_a: np.ndarray,
+    image_b: np.ndarray,
+    dino_weights: str | Path,
+    config: PasmV0Config,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """只加载 DINOv2 提取静态 Patch 预算所需的双图 token。"""
+    encoder = DINOv2PatchEncoder(dino_weights, image_size=config.image_size).to(device).eval()
+    images = torch.from_numpy(np.stack((image_a, image_b), axis=0)).to(device)
+    with torch.inference_mode():
+        tokens = pool_dino_tokens(
+            encoder(images), config.patch_rows, config.patch_cols
+        )
+    del encoder
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return tokens[:1], tokens[1:]
+
+
 def round_anchor_counts(rounds: list[RoundRecord], patch_count: int) -> tuple[np.ndarray, np.ndarray]:
     """按每轮记录的锚点索引统计两图各 Patch 的锚点数量。"""
     if patch_count <= 0:
@@ -177,6 +345,29 @@ def save_round_point_distribution(
         for x_value, y_value in np.asarray(points, dtype=np.float32):
             painter.ellipse((x_value + x_offset - 2, y_value - 2, x_value + x_offset + 2, y_value + 2), fill="red")
     painter.text((8, 8), f"第 {round_index} 轮采样点", fill="yellow")
+    canvas.save(output_path)
+
+
+def save_static_point_distribution(
+    output_path: str | Path,
+    image_a: np.ndarray,
+    image_b: np.ndarray,
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    mode: str,
+) -> None:
+    """将 v0.3 单轮静态选点绘制为左右图对照图。"""
+    from PIL import ImageDraw
+
+    canvas, offset = _side_by_side_image(image_a, image_b)
+    painter = ImageDraw.Draw(canvas)
+    for points, x_offset in ((points_a, 0), (points_b, offset)):
+        for x_value, y_value in np.asarray(points, dtype=np.float32):
+            painter.ellipse(
+                (x_value + x_offset - 2, y_value - 2, x_value + x_offset + 2, y_value + 2),
+                fill="red",
+            )
+    painter.text((8, 8), f"{mode} 静态选点：{len(points_a)} + {len(points_b)}", fill="yellow")
     canvas.save(output_path)
 
 
@@ -227,7 +418,7 @@ def _to_pillow_image(image: np.ndarray):
 
 def main() -> None:
     """解析命令行参数并执行 PASM v0 两图推理。"""
-    parser = argparse.ArgumentParser(description="运行 PASM v0 的三轮点级联合重采样")
+    parser = argparse.ArgumentParser(description="运行 PASM v0 的两图匹配推理")
     parser.add_argument("--image-a", type=Path, required=True, help="第一张输入图像")
     parser.add_argument("--image-b", type=Path, required=True, help="第二张输入图像")
     parser.add_argument("--dino-weights", type=Path, required=True, help="DINOv2 权重路径")
@@ -236,6 +427,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True, help="本次实验的输出文件夹")
     parser.add_argument("--device", default="auto", help="auto、cuda 或 cpu")
     parser.add_argument("--seed", type=int, default=0, help="采样随机种子")
+    parser.add_argument(
+        "--mode",
+        choices=("iterative_loma", "static_semantic", "dad_global", "pasm_dad"),
+        default="iterative_loma",
+        help="推理模式：旧版三轮、旧版静态语义、DaD 全局或 PASM 静态预算",
+    )
+    parser.add_argument("--dad-weights", type=Path, help="DaD 本地权重路径，v0.3 模式必需")
     parser.add_argument(
         "--strengthened-sampling", action="store_true", help="使用当前强化采样参数，不修改检查点权重"
     )
@@ -250,6 +448,8 @@ def main() -> None:
         args.device,
         args.seed,
         args.strengthened_sampling,
+        args.mode,
+        args.dad_weights,
     )
     print(output)
 

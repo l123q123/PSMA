@@ -17,6 +17,7 @@ from pasm_v0.infer import (
     round_anchor_counts,
     save_match_visualization,
     save_round_point_distribution,
+    static_experiment_output_paths,
 )
 from pasm_v0.matching import PairSemanticEncoder
 from pasm_v0.pipeline import RoundRecord
@@ -48,6 +49,23 @@ class PasmV0CliTests(unittest.TestCase):
         self.assertIn("--image-a", result.stdout)
         self.assertIn("--dino-weights", result.stdout)
         self.assertIn("--checkpoint", result.stdout)
+
+    def test_inference_help_exposes_v03_modes_and_dad_weights(self) -> None:
+        """推理帮助应提供 v0.3 模式选择和本地 DaD 权重参数。"""
+        script = Path(__file__).parents[1] / "pasm_v0" / "infer.py"
+
+        result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--mode", result.stdout)
+        self.assertIn("pasm_dad", result.stdout)
+        self.assertIn("dad_global", result.stdout)
+        self.assertIn("--dad-weights", result.stdout)
 
     def test_quality_teacher_defaults_keep_ten_pairs_and_hundred_display_edges(self) -> None:
         """软质量教师命令应默认处理十对图并限制每张连线图的边数。"""
@@ -148,6 +166,17 @@ class PasmV0CliTests(unittest.TestCase):
         """推理输出必须是目录，不能再传入旧版 NPZ 文件路径。"""
         with self.assertRaises(ValueError):
             experiment_output_paths("outputs/result.npz")
+
+    def test_static_experiment_output_directory_uses_v03_names(self) -> None:
+        """v0.3 静态推理应使用单轮点图和统一结果文件名。"""
+        with tempfile.TemporaryDirectory() as directory:
+            paths = static_experiment_output_paths(Path(directory) / "实验二")
+
+            self.assertEqual(paths.result.name, "result.npz")
+            self.assertEqual(paths.points.name, "points.png")
+            self.assertEqual(paths.matches.name, "matches.png")
+            self.assertEqual(paths.high_confidence_matches.name, "high_confidence_matches.png")
+            self.assertTrue(paths.result.parent.is_dir())
 
     def test_round_anchor_counts_follow_recorded_patch_ids(self) -> None:
         """推理输出统计应按锚点所在 Patch 记录每轮数量。"""

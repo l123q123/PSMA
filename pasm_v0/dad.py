@@ -103,6 +103,8 @@ def select_patch_budgeted_points(
     patch_ids = []
     scores = []
     for patch_id, budget in enumerate(allocation):
+        if budget == 0:
+            continue
         selected = 0
         candidates = np.flatnonzero(nms_patch_ids == patch_id)
         ordered = candidates[np.argsort(-nms_scores[candidates], kind="stable")]
