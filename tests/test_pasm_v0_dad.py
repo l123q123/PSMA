@@ -13,6 +13,7 @@ from pasm_v0.dad import (
     FrozenDaDDetector,
     _image_tensor,
     _normalized_to_pixels,
+    select_dad_candidate_pool,
     select_global_dad_points,
     select_patch_budgeted_points,
 )
@@ -81,6 +82,36 @@ class DaDSelectionTests(unittest.TestCase):
         np.testing.assert_allclose(points, np.array([[6.2, 6.3], [3.5, 1.5]], dtype=np.float32))
         np.testing.assert_allclose(scores, np.array([0.01, 0.9], dtype=np.float32))
         self.assertEqual(len(np.unique(points, axis=0)), len(points))
+
+    def test_candidate_pool_uses_highest_unique_nms_points(self) -> None:
+        """融合教师候选池必须按 DaD 分数降序保留不重复的 NMS 点。"""
+        detections = DaDDetections(
+            dense_scores=np.zeros((8, 8), dtype=np.float32),
+            nms_points=np.array([[2.2, 2.2], [2.8, 2.1], [6.3, 1.2], [1.1, 6.4]], dtype=np.float32),
+            nms_scores=np.array([0.9, 0.8, 0.7, 0.6], dtype=np.float32),
+        )
+
+        points, scores = select_dad_candidate_pool(detections, candidate_count=3)
+
+        np.testing.assert_allclose(
+            points,
+            np.array([[2.2, 2.2], [6.3, 1.2], [1.1, 6.4]], dtype=np.float32),
+        )
+        np.testing.assert_allclose(scores, np.array([0.9, 0.7, 0.6], dtype=np.float32))
+        self.assertEqual(len(np.unique(np.floor(points).astype(np.int64), axis=0)), 3)
+
+    def test_dad_detection_container_preserves_dense_fusion_inputs(self) -> None:
+        """融合头需要读取冻结 DaD 的单通道 logits 与 32 通道特征图。"""
+        detections = DaDDetections(
+            dense_scores=np.zeros((8, 8), dtype=np.float32),
+            nms_points=np.array([[1.0, 1.0]], dtype=np.float32),
+            nms_scores=np.array([1.0], dtype=np.float32),
+            dense_logits=np.ones((8, 8), dtype=np.float32),
+            feature_map=np.ones((8, 8, 32), dtype=np.float32),
+        )
+
+        self.assertEqual(detections.dense_logits.shape, (8, 8))
+        self.assertEqual(detections.feature_map.shape, (8, 8, 32))
 
     def test_frozen_dad_rejects_missing_local_weights(self) -> None:
         """冻结 DaD 必须在加载模型前拒绝不存在的本地权重。"""

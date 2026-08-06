@@ -19,6 +19,8 @@ class DaDDetections:
     dense_scores: np.ndarray
     nms_points: np.ndarray
     nms_scores: np.ndarray
+    dense_logits: np.ndarray | None = None
+    feature_map: np.ndarray | None = None
 
 
 class FrozenDaDDetector:
@@ -58,7 +60,7 @@ class FrozenDaDDetector:
         from loma.detector.dad import sample_keypoints
 
         tensor = _image_tensor(image, self.image_size, self.device)
-        scoremap = self.model.forward_impl(tensor)
+        scoremap, feature_map = self._forward_with_features(tensor)
         batch, channels, height, width = scoremap.shape
         if batch != 1 or channels != 1 or (height, width) != (self.image_size, self.image_size):
             raise ValueError("DaD 输出尺寸与输入图像尺寸不一致")
@@ -88,7 +90,34 @@ class FrozenDaDDetector:
             dense_scores=dense_scores[0].float().cpu().numpy().astype(np.float32),
             nms_points=points,
             nms_scores=scores,
+            dense_logits=scoremap[0, 0].float().cpu().numpy().astype(np.float32),
+            feature_map=feature_map[0].permute(1, 2, 0).float().cpu().numpy().astype(np.float32),
         )
+
+    def _forward_with_features(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """复现 DaD 解码路径并保留最终 32 通道上下文特征。"""
+        normalized = self.model.normalizer(images)
+        features, sizes = self.model.encoder(normalized)
+        logits: torch.Tensor = normalized[:, :1].new_zeros(())
+        context = None
+        fusion_features = None
+        scales = ("8", "4", "2", "1")
+        for index, (feature_map, scale) in enumerate(zip(reversed(features), scales)):
+            delta_logits, context = self.model.decoder(feature_map, context=context, scale=scale)
+            logits = logits + delta_logits.float()
+            if scale == "2":
+                fusion_features = context.float()
+            if index < len(scales) - 1:
+                size = sizes[-(index + 2)]
+                logits = torch.nn.functional.interpolate(
+                    logits, size=size, mode="bicubic", align_corners=False
+                )
+                context = torch.nn.functional.interpolate(
+                    context.float(), size=size, mode="bilinear", align_corners=False
+                )
+        if fusion_features is None or fusion_features.ndim != 4 or fusion_features.shape[1] != 32:
+            raise ValueError("DaD scale=2 context 必须是 [B, 32, H, W] 特征图")
+        return logits.float(), fusion_features
 
 
 def select_patch_budgeted_points(
@@ -175,6 +204,36 @@ def select_global_dad_points(
     if len(result_points) != point_count or len(used_cells) != point_count:
         raise ValueError("DaD 稠密分数无法填满全局点预算")
     return result_points, result_scores
+
+
+def select_dad_candidate_pool(
+    detections: DaDDetections, candidate_count: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """从冻结 DaD 的 NMS 峰中按分数构造不重复的大候选池。"""
+    if candidate_count <= 0:
+        raise ValueError("DaD 候选池大小必须为正数")
+    nms_points = np.asarray(detections.nms_points, dtype=np.float64)
+    nms_scores = np.asarray(detections.nms_scores, dtype=np.float64).reshape(-1)
+    if nms_points.ndim != 2 or nms_points.shape[1:] != (2,) or len(nms_points) != len(nms_scores):
+        raise ValueError("DaD NMS 点和分数形状必须一致")
+    if not np.isfinite(nms_points).all() or not np.isfinite(nms_scores).all():
+        raise ValueError("DaD 候选池输入必须是有限数组")
+    selected_points: list[np.ndarray] = []
+    selected_scores: list[float] = []
+    used_cells: set[tuple[int, int]] = set()
+    for index in np.argsort(-nms_scores, kind="stable"):
+        point = nms_points[int(index)]
+        cell = (int(np.floor(point[1])), int(np.floor(point[0])))
+        if cell in used_cells:
+            continue
+        used_cells.add(cell)
+        selected_points.append(point.astype(np.float32))
+        selected_scores.append(float(nms_scores[int(index)]))
+        if len(selected_points) == candidate_count:
+            break
+    if len(selected_points) < candidate_count:
+        raise ValueError("DaD NMS 峰数量不足以构造指定候选池")
+    return np.asarray(selected_points, dtype=np.float32), np.asarray(selected_scores, dtype=np.float32)
 
 
 def _validated_detections(
