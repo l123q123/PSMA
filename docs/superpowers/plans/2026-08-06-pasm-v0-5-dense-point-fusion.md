@@ -23,12 +23,11 @@
 ### Task 1: Expose frozen DaD dense features and candidate pools
 
 **Files:**
-- Modify: `D:/研0新方向/论文调研/Loma实验/LoMa-main/LoMa-main/src/loma/detector/dad.py`
 - Modify: `D:/研0新方向/论文调研/Loma实验/PASM-v0/.worktrees/v0.3-pasm-dad-static/pasm_v0/dad.py`
 - Test: `D:/研0新方向/论文调研/Loma实验/PASM-v0/.worktrees/v0.3-pasm-dad-static/tests/test_pasm_v0_dad.py`
 
 **Interfaces:**
-- Native DaD adds `forward_impl(images, return_features=False)` and returns `(logits, context)` when `return_features=True`; `context` is the final 32-channel decoder feature map.
+- `FrozenDaDDetector` locally reproduces the native decoder loop and captures the `scale="2"` 32-channel context without modifying the external LoMa checkout; the final `scale="1"` context is one channel and is not used as fusion input.
 - `FrozenDaDDetector.detect()` returns `DaDDetections(dense_scores, nms_points, nms_scores, dense_logits, feature_map)` with all arrays detached and on CPU.
 - Add `select_dad_candidate_pool(detections, candidate_count) -> tuple[np.ndarray, np.ndarray]`, selecting the highest-scoring unique NMS points without applying the final 1024-point limit.
 
@@ -58,29 +57,15 @@ Run from the PASM worktree:
 
 Expected: failure for the missing `dense_logits`, `feature_map`, and candidate-pool interface.
 
-- [ ] **Step 3: Add the native DaD return path.**
-
-In native `forward_impl`, preserve the final decoder `context` and return it only when requested:
-
-```python
-def forward_impl(self, images, return_features=False):
-    ...
-    if return_features:
-        return logits.float(), context.float()
-    return logits.float()
-```
-
-Update native `forward()` to pass through `return_features` and expose `dense_features` in its result without changing the default API.
-
-- [ ] **Step 4: Extend `DaDDetections` and `FrozenDaDDetector.detect()`.**
+- [ ] **Step 3: Extend `DaDDetections` and `FrozenDaDDetector.detect()`.**
 
 Store `scoremap[0, 0]` as `dense_logits` and `context[0]` as `[H, W, 32]` `feature_map`, while retaining the existing normalized `dense_scores`, NMS points, and NMS scores. All returned tensors must be detached before conversion to NumPy.
 
-- [ ] **Step 5: Implement `select_dad_candidate_pool()`.**
+- [ ] **Step 4: Implement `select_dad_candidate_pool()`.**
 
 Validate `candidate_count > 0`, sort NMS candidates by descending `nms_scores`, remove duplicate integer pixel cells, and return at most the requested count. Raise a clear error if the detector produces fewer valid candidates than requested.
 
-- [ ] **Step 6: Run the focused tests and a CUDA smoke check.**
+- [ ] **Step 5: Run the focused tests and a CUDA smoke check.**
 
 ```powershell
 & 'D:\anaconda3\envs\loma\python.exe' -m pytest tests/test_pasm_v0_dad.py -q
@@ -89,10 +74,10 @@ Validate `candidate_count > 0`, sort NMS candidates by descending `nms_scores`, 
 
 Expected: all focused tests pass and the import smoke check prints `dad import ok`.
 
-- [ ] **Step 7: Commit only the DaD API changes.**
+- [ ] **Step 6: Commit only the DaD API changes.**
 
 ```powershell
-git add 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\src\loma\detector\dad.py' 'pasm_v0\dad.py' 'tests\test_pasm_v0_dad.py'
+git add 'pasm_v0\dad.py' 'tests\test_pasm_v0_dad.py'
 git commit -m "feat: expose frozen dad dense features"
 ```
 
