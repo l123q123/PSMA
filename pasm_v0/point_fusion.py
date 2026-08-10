@@ -68,6 +68,106 @@ class DensePointFusion(nn.Module):
         return base_logits + self.alpha * delta
 
 
+def local_logit_zscore(
+    logits: torch.Tensor,
+    window_size: int = 5,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """计算 reflect 局部窗口中的 DaD logit 标准分数。"""
+    if logits.ndim != 4 or logits.shape[1] != 1 or not torch.isfinite(logits).all():
+        raise ValueError("局部对比度输入必须是有限的 [B, 1, H, W] logits")
+    if window_size < 3 or window_size % 2 == 0 or eps <= 0.0:
+        raise ValueError("局部窗口必须是大于等于 3 的奇数，eps 必须为正数")
+    radius = window_size // 2
+    height, width = logits.shape[-2:]
+    if height <= radius or width <= radius:
+        raise ValueError("logit 空间尺寸不足以进行 reflect 局部统计")
+    padded = F.pad(logits, (radius, radius, radius, radius), mode="reflect")
+    mean = F.avg_pool2d(padded, kernel_size=window_size, stride=1)
+    mean_square = F.avg_pool2d(padded.square(), kernel_size=window_size, stride=1)
+    variance = torch.clamp_min(mean_square - mean.square(), 0.0)
+    return (logits - mean) / (variance.sqrt() + eps)
+
+
+class ContrastiveDensePointFusion(nn.Module):
+    """以双图语义调制 DaD 局部对比度，而非直接预测任意残差。"""
+
+    def __init__(
+        self,
+        semantic_dim: int = 128,
+        dad_channels: int = 32,
+        hidden_channels: int = 64,
+        local_window_size: int = 5,
+        initial_control_bias: float = -5.0,
+    ) -> None:
+        super().__init__()
+        if semantic_dim <= 0 or dad_channels <= 0 or hidden_channels <= 0:
+            raise ValueError("融合头通道数必须为正数")
+        if local_window_size < 3 or local_window_size % 2 == 0:
+            raise ValueError("局部对比度窗口必须是大于等于 3 的奇数")
+        self.semantic_projection = nn.Linear(semantic_dim, dad_channels)
+        self.context = nn.Sequential(
+            nn.Conv2d(
+                dad_channels * 3,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode="reflect",
+            ),
+            nn.GroupNorm(num_groups=8 if hidden_channels % 8 == 0 else 1, num_channels=hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode="reflect",
+            ),
+            nn.GELU(),
+        )
+        self.gain_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        self.penalty_head = nn.Conv2d(hidden_channels, 1, kernel_size=1)
+        nn.init.zeros_(self.gain_head.weight)
+        nn.init.zeros_(self.penalty_head.weight)
+        nn.init.constant_(self.gain_head.bias, initial_control_bias)
+        nn.init.constant_(self.penalty_head.bias, initial_control_bias)
+        self.local_window_size = local_window_size
+
+    def forward(
+        self,
+        dad_features: torch.Tensor,
+        base_logits: torch.Tensor,
+        semantic_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """在语义特征条件下增强局部突出的 DaD 点并压制低对比度点。"""
+        _validate_inputs(dad_features, base_logits, semantic_tokens)
+        height, width = base_logits.shape[-2:]
+        dad = F.interpolate(dad_features, size=(height, width), mode="bilinear", align_corners=False)
+        token_count = semantic_tokens.shape[1]
+        grid = math.isqrt(token_count)
+        if grid * grid != token_count:
+            raise ValueError("语义 token 数量必须是正方形网格")
+        semantic = self.semantic_projection(semantic_tokens)
+        semantic = semantic.transpose(1, 2).reshape(
+            semantic_tokens.shape[0], -1, grid, grid
+        )
+        semantic = F.interpolate(semantic, size=(height, width), mode="bilinear", align_corners=False)
+        context = self.context(torch.cat((dad, semantic, dad * semantic), dim=1))
+        gain = F.softplus(self.gain_head(context))
+        penalty = F.softplus(self.penalty_head(context))
+        zscore = local_logit_zscore(base_logits, window_size=self.local_window_size)
+        return base_logits + gain * zscore - penalty
+
+
+def create_point_fusion(mode: str = "residual") -> nn.Module:
+    """根据检查点/训练配置创建指定融合头，保留 v0.5 默认残差模式。"""
+    if mode == "residual":
+        return DensePointFusion()
+    if mode == "contrastive":
+        return ContrastiveDensePointFusion()
+    raise ValueError("融合模式必须是 residual 或 contrastive")
+
+
 def point_candidate_logits(
     dense_logits: torch.Tensor,
     points_xy: torch.Tensor,

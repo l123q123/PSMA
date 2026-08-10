@@ -17,7 +17,7 @@ from .dad import FrozenDaDDetector, select_dad_candidate_pool
 from .data import load_manifest
 from .geometry import load_pair_geometry
 from .infer import load_runner
-from .point_fusion import DensePointFusion, point_candidate_logits
+from .point_fusion import create_point_fusion, point_candidate_logits
 from .point_teacher import build_candidate_teacher
 
 
@@ -30,6 +30,9 @@ class PointFusionTrainConfig:
     teacher_search_radius_px: float = 12.0
     ranking_weight: float = 0.5
     ranking_margin: float = 0.2
+    fusion_mode: str = "residual"
+    ranking_mode: str = "hinge"
+    ranking_temperature: float = 1.0
 
     def __post_init__(self) -> None:
         if self.teacher_candidate_count <= 0:
@@ -38,6 +41,12 @@ class PointFusionTrainConfig:
             raise ValueError("教师 sigma 和搜索半径必须为正数")
         if self.ranking_weight < 0.0 or self.ranking_margin < 0.0:
             raise ValueError("排序损失权重和间隔不能为负数")
+        if self.fusion_mode not in {"residual", "contrastive"}:
+            raise ValueError("融合模式必须是 residual 或 contrastive")
+        if self.ranking_mode not in {"hinge", "soft_pairwise"}:
+            raise ValueError("排序模式必须是 hinge 或 soft_pairwise")
+        if self.ranking_temperature <= 0.0:
+            raise ValueError("排序温度必须为正数")
 
 
 def point_fusion_loss(
@@ -47,17 +56,29 @@ def point_fusion_loss(
     labels_b: torch.Tensor,
     ranking_weight: float,
     ranking_margin: float = 0.2,
+    ranking_mode: str = "hinge",
+    ranking_temperature: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """计算双图候选点 soft BCE 与正负排序损失。"""
-    _validate_loss_inputs(logits_a, labels_a, logits_b, labels_b, ranking_weight, ranking_margin)
+    _validate_loss_inputs(
+        logits_a, labels_a, logits_b, labels_b, ranking_weight, ranking_margin,
+        ranking_mode, ranking_temperature,
+    )
     point = 0.5 * (
         F.binary_cross_entropy_with_logits(logits_a, labels_a)
         + F.binary_cross_entropy_with_logits(logits_b, labels_b)
     )
-    rank = 0.5 * (
-        _ranking_loss(logits_a, labels_a, ranking_margin)
-        + _ranking_loss(logits_b, labels_b, ranking_margin)
-    )
+    rank_loss = _ranking_loss if ranking_mode == "hinge" else _soft_pairwise_ranking_loss
+    if ranking_mode == "hinge":
+        rank = 0.5 * (
+            rank_loss(logits_a, labels_a, ranking_margin)
+            + rank_loss(logits_b, labels_b, ranking_margin)
+        )
+    else:
+        rank = 0.5 * (
+            rank_loss(logits_a, labels_a, ranking_temperature)
+            + rank_loss(logits_b, labels_b, ranking_temperature)
+        )
     return point + ranking_weight * rank, point, rank
 
 
@@ -76,6 +97,9 @@ def train_model(
     teacher_sigma_px: float = 3.0,
     teacher_search_radius_px: float = 12.0,
     ranking_weight: float = 0.5,
+    fusion_mode: str = "residual",
+    ranking_mode: str = "hinge",
+    ranking_temperature: float = 1.0,
     seed: int = 0,
 ) -> Path:
     """冻结 DaD/DINO/语义编码器，仅训练 v0.5 稠密融合头。"""
@@ -86,6 +110,9 @@ def train_model(
         teacher_sigma_px=teacher_sigma_px,
         teacher_search_radius_px=teacher_search_radius_px,
         ranking_weight=ranking_weight,
+        fusion_mode=fusion_mode,
+        ranking_mode=ranking_mode,
+        ranking_temperature=ranking_temperature,
     )
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -100,7 +127,7 @@ def train_model(
         parameter.requires_grad = False
     dino = DINOv2PatchEncoder(dino_weights, source_config.image_size).to(selected_device).eval()
     detector = FrozenDaDDetector(dad_weights, source_config.image_size, selected_device)
-    fusion = DensePointFusion().to(selected_device)
+    fusion = create_point_fusion(settings.fusion_mode).to(selected_device)
     optimizer = torch.optim.Adam(fusion.parameters(), lr=learning_rate)
     pairs = [pair for pair in load_manifest(manifest_path) if pair.label == 1]
     if max_pairs is not None:
@@ -164,6 +191,8 @@ def train_model(
                 torch.from_numpy(labels_b).to(selected_device),
                 settings.ranking_weight,
                 settings.ranking_margin,
+                settings.ranking_mode,
+                settings.ranking_temperature,
             )
             optimizer.zero_grad(set_to_none=True)
             total.backward()
@@ -194,7 +223,7 @@ def train_model(
 
 def _save_checkpoint(
     path: Path,
-    fusion: DensePointFusion,
+    fusion: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     source_config: object,
     semantic_checkpoint: str | Path,
@@ -213,6 +242,9 @@ def _save_checkpoint(
             "source_config": asdict(source_config),
             "semantic_checkpoint": str(Path(semantic_checkpoint)),
             "settings": asdict(settings),
+            "fusion_mode": settings.fusion_mode,
+            "ranking_mode": settings.ranking_mode,
+            "ranking_temperature": settings.ranking_temperature,
         },
         path,
     )
@@ -249,12 +281,33 @@ def _ranking_loss(logits: torch.Tensor, labels: torch.Tensor, margin: float) -> 
     return torch.relu(torch.as_tensor(margin, device=logits.device, dtype=logits.dtype) - positive.mean() + negative.mean())
 
 
+def _soft_pairwise_ranking_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """使用标签差值加权的连续正负 pairwise 排序，始终保留平滑梯度。"""
+    positive_mask = labels >= 0.5
+    negative_mask = labels <= 0.1
+    positive_logits = logits[positive_mask]
+    negative_logits = logits[negative_mask]
+    if positive_logits.numel() == 0 or negative_logits.numel() == 0:
+        return logits.sum() * 0.0
+    logit_gap = positive_logits[:, None] - negative_logits[None, :]
+    label_gap = labels[positive_mask][:, None] - labels[negative_mask][None, :]
+    weights = label_gap.detach()
+    losses = F.softplus(-logit_gap / temperature)
+    return (losses * weights).sum() / weights.sum().clamp_min(torch.finfo(weights.dtype).eps)
+
+
 def _validate_loss_inputs(
     logits_a: torch.Tensor, labels_a: torch.Tensor, logits_b: torch.Tensor, labels_b: torch.Tensor,
-    ranking_weight: float, ranking_margin: float,
+    ranking_weight: float, ranking_margin: float, ranking_mode: str, ranking_temperature: float,
 ) -> None:
     if ranking_weight < 0.0 or ranking_margin < 0.0:
         raise ValueError("排序损失权重和间隔不能为负数")
+    if ranking_mode not in {"hinge", "soft_pairwise"} or ranking_temperature <= 0.0:
+        raise ValueError("排序模式或排序温度无效")
     for logits, labels in ((logits_a, labels_a), (logits_b, labels_b)):
         if logits.ndim != 1 or labels.shape != logits.shape or not torch.isfinite(logits).all() or not torch.isfinite(labels).all():
             raise ValueError("候选 logits 和标签必须是同形有限一维张量")
@@ -286,6 +339,9 @@ def main() -> None:
     parser.add_argument("--teacher-sigma-px", type=float, default=3.0)
     parser.add_argument("--teacher-search-radius-px", type=float, default=12.0)
     parser.add_argument("--ranking-weight", type=float, default=0.5)
+    parser.add_argument("--fusion-mode", choices=("residual", "contrastive"), default="residual")
+    parser.add_argument("--ranking-mode", choices=("hinge", "soft_pairwise"), default="hinge")
+    parser.add_argument("--ranking-temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     print(train_model(**train_options_from_args(args)))

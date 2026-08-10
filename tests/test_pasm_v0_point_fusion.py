@@ -2,10 +2,63 @@ import unittest
 
 import torch
 
-from pasm_v0.point_fusion import DensePointFusion, point_candidate_logits, select_dense_topk
+from pasm_v0.point_fusion import (
+    ContrastiveDensePointFusion,
+    DensePointFusion,
+    create_point_fusion,
+    local_logit_zscore,
+    point_candidate_logits,
+    select_dense_topk,
+)
 
 
 class DensePointFusionTests(unittest.TestCase):
+    def test_local_logit_zscore_is_finite_and_orders_local_contrast(self) -> None:
+        logits = torch.zeros(1, 1, 7, 7)
+        logits[0, 0, 3, 3] = 4.0
+        logits[0, 0, 3, 2] = -2.0
+
+        zscore = local_logit_zscore(logits, window_size=5)
+
+        self.assertTrue(torch.isfinite(zscore).all())
+        self.assertGreater(float(zscore[0, 0, 3, 3]), 0.0)
+        self.assertLess(float(zscore[0, 0, 3, 2]), 0.0)
+        torch.testing.assert_close(local_logit_zscore(torch.ones_like(logits)), torch.zeros_like(logits))
+
+    def test_contrastive_fusion_is_near_identity_at_initialization(self) -> None:
+        model = ContrastiveDensePointFusion()
+        dad = torch.randn(1, 32, 8, 8)
+        base = torch.randn(1, 1, 16, 16)
+        tokens = torch.randn(1, 16 * 16, 128)
+
+        output = model(dad, base, tokens)
+
+        torch.testing.assert_close(output, base, atol=0.05, rtol=0.0)
+
+    def test_contrastive_fusion_amplifies_high_local_dad_logits_and_reduces_low_ones(self) -> None:
+        model = ContrastiveDensePointFusion()
+        with torch.no_grad():
+            model.gain_head.weight.zero_()
+            model.gain_head.bias.zero_()
+            model.penalty_head.weight.zero_()
+            model.penalty_head.bias.fill_(-20.0)
+        dad = torch.zeros(1, 32, 8, 8)
+        base = torch.zeros(1, 1, 9, 9)
+        base[0, 0, 4, 4] = 4.0
+        base[0, 0, 4, 3] = -2.0
+        tokens = torch.zeros(1, 16 * 16, 128)
+
+        output = model(dad, base, tokens)
+
+        self.assertGreater(float(output[0, 0, 4, 4]), float(base[0, 0, 4, 4]))
+        self.assertLess(float(output[0, 0, 4, 3]), float(base[0, 0, 4, 3]))
+
+    def test_fusion_factory_preserves_residual_default_and_rejects_unknown_mode(self) -> None:
+        self.assertIsInstance(create_point_fusion("residual"), DensePointFusion)
+        self.assertIsInstance(create_point_fusion("contrastive"), ContrastiveDensePointFusion)
+        with self.assertRaises(ValueError):
+            create_point_fusion("unknown")
+
     def test_residual_zero_initialization_preserves_dad_base_logits(self) -> None:
         model = DensePointFusion(semantic_dim=128, dad_channels=32, alpha_init=0.0)
         dad = torch.randn(1, 32, 16, 16)

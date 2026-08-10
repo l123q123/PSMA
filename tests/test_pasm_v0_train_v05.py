@@ -18,6 +18,12 @@ class PointFusionTrainingTests(unittest.TestCase):
             PointFusionTrainConfig(teacher_candidate_count=0)
         with self.assertRaises(ValueError):
             PointFusionTrainConfig(teacher_sigma_px=0.0)
+        with self.assertRaises(ValueError):
+            PointFusionTrainConfig(fusion_mode="unknown")
+        with self.assertRaises(ValueError):
+            PointFusionTrainConfig(ranking_mode="unknown")
+        with self.assertRaises(ValueError):
+            PointFusionTrainConfig(ranking_temperature=0.0)
 
     def test_point_fusion_loss_backpropagates_through_candidate_logits(self) -> None:
         logits_a = torch.tensor([1.0, -1.0], requires_grad=True)
@@ -31,6 +37,28 @@ class PointFusionTrainingTests(unittest.TestCase):
         self.assertGreaterEqual(float(rank.detach()), 0.0)
         self.assertIsNotNone(logits_a.grad)
         self.assertIsNotNone(logits_b.grad)
+
+    def test_soft_pairwise_ranking_remains_positive_after_hinge_margin_is_satisfied(self) -> None:
+        logits_a = torch.tensor([3.0, -3.0], requires_grad=True)
+        logits_b = torch.tensor([4.0, -4.0], requires_grad=True)
+        labels = torch.tensor([1.0, 0.0])
+
+        _, _, hinge_rank = point_fusion_loss(logits_a, labels, logits_b, labels, ranking_weight=1.0)
+        total, _, soft_pairwise_rank = point_fusion_loss(
+            logits_a,
+            labels,
+            logits_b,
+            labels,
+            ranking_weight=1.0,
+            ranking_mode="soft_pairwise",
+            ranking_temperature=1.0,
+        )
+        total.backward()
+
+        self.assertEqual(float(hinge_rank.detach()), 0.0)
+        self.assertGreater(float(soft_pairwise_rank.detach()), 0.0)
+        self.assertGreater(float(logits_a.grad.abs().sum()), 0.0)
+        self.assertGreater(float(logits_b.grad.abs().sum()), 0.0)
 
     def test_make_trainable_tensor_allows_frozen_semantic_tokens_in_fusion_backward(self) -> None:
         with torch.inference_mode():
