@@ -27,6 +27,12 @@ class DensePointFusionTests(unittest.TestCase):
                 output = model(dad, base, torch.randn(1, grid * grid, 128))
                 self.assertEqual(tuple(output.shape), (1, 1, 16, 16))
 
+    def test_fusion_convolutions_use_reflect_padding_at_image_boundaries(self) -> None:
+        model = DensePointFusion()
+        convolutions = [layer for layer in model.fusion if isinstance(layer, torch.nn.Conv2d)]
+
+        self.assertEqual([layer.padding_mode for layer in convolutions[:-1]], ["reflect", "reflect"])
+
     def test_candidate_logits_are_bilinearly_sampled_at_pixel_coordinates(self) -> None:
         logits = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
         points = torch.tensor([[0.0, 0.0], [3.0, 3.0]], dtype=torch.float32)

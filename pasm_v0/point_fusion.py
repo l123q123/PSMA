@@ -24,10 +24,22 @@ class DensePointFusion(nn.Module):
             raise ValueError("融合头通道数必须为正数")
         self.semantic_projection = nn.Linear(semantic_dim, dad_channels)
         self.fusion = nn.Sequential(
-            nn.Conv2d(dad_channels * 2 + 1, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(
+                dad_channels * 2 + 1,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode="reflect",
+            ),
             nn.GroupNorm(num_groups=8 if hidden_channels % 8 == 0 else 1, num_channels=hidden_channels),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode="reflect",
+            ),
             nn.GELU(),
             nn.Conv2d(hidden_channels, 1, kernel_size=1),
         )
