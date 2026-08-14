@@ -12,7 +12,7 @@
 - 单轮静态流程：双图语义编码器输出 Patch 价值，预算分配后由 DaD 在每个 Patch 内选点，再由冻结 LoMa matcher 匹配。
 - 一层双向 Cross-Attention，`hidden_dim=128`，`heads=4`。
 - `value_only`：仅几何 Patch 价值损失参与反向传播。
-- 总预算 1024 点，Patch 单块上限 4，`budget_score_power=1.0`。
+- 总预算 1024 点，37×37 Patch 单块上限 4；16×16 Patch 单块上限 20，`budget_score_power=1.0`。
 - 几何教师仍由 MegaDepth 深度、内外参与相机位姿投影生成，规则支持点间隔为 2 像素。
 - 训练清单和九组 held-out 评测图像完全沿用现有 v0.4 实验。
 
@@ -28,7 +28,7 @@
 
 ## 最小实现
 
-- 为 v0.4 静态配置提供 `16` 或 `37` 的网格选择，默认保持 37，避免影响已有命令和 checkpoint。
+- 为 v0.4 静态配置提供 `16` 或 `37` 的网格选择，默认保持 37；16×16 使用上限 20，避免 256 个 Patch × 4 点恰好耗尽全部预算而失去价值分配作用。
 - `cache_v04_targets` 支持 `--patch-grid 16`，单独生成 `geometry` 的 16×16、stride=2 缓存；37×37 缓存不能复用，因为监督向量长度与 Patch 边界均不同。
 - `train_v04` 支持 `--patch-grid 16`，训练时把该配置写入 checkpoint。
 - `evaluate_v04` 支持 `--patch-grid 16`，同时验证两个 checkpoint 的网格配置与所选网格一致。

@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 默认 `patch_grid=37`，现有 v0.4 命令和 checkpoint 行为不变。
-- 新实验使用 `patch_grid=16`、`total_points=1024`、`max_points_per_patch=4`、`budget_score_power=1.0`。
+- 新实验使用 `patch_grid=16`、`total_points=1024`、`max_points_per_patch=20`、`budget_score_power=1.0`；默认 37×37 仍使用上限 4。
 - 几何教师缓存使用 `geometry` 和 `stride=2`，16×16 缓存单独保存。
 - 不修改 DINOv2、DaD、LoMa 权重、匹配规则、损失公式或 Cross-Attention 层数。
 - 代码改动保持最小，不新增独立模型模块。

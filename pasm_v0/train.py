@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from pasm_v0.backbones import FrozenFeatureExtractor, load_resized_rgb, resolve_device
-    from pasm_v0.config import PasmV0Config
+    from pasm_v0.config import PasmV0Config, legacy_iterative_37_config
     from pasm_v0.data import load_manifest
     from pasm_v0.geometry import PairGeometry, load_pair_geometry, projected_match_targets, projected_patch_support_targets
     from pasm_v0.matching import PairSemanticEncoder
@@ -24,13 +24,18 @@ if __package__ in {None, ""}:
     from pasm_v0.training import pasm_v0_loss
 else:
     from .backbones import FrozenFeatureExtractor, load_resized_rgb, resolve_device
-    from .config import PasmV0Config
+    from .config import PasmV0Config, legacy_iterative_37_config
     from .data import load_manifest
     from .geometry import PairGeometry, load_pair_geometry, projected_match_targets, projected_patch_support_targets
     from .matching import PairSemanticEncoder
     from .pipeline import PasmV0, RoundRecord
     from .sampling import PatchLayout
     from .training import pasm_v0_loss
+
+
+def training_config(legacy_37: bool = False) -> PasmV0Config:
+    """返回默认配置或 37×37 旧三轮实验配置。"""
+    return legacy_iterative_37_config() if legacy_37 else PasmV0Config()
 
 
 def train_model(
@@ -46,13 +51,14 @@ def train_model(
     max_pairs: int | None = None,
     seed: int = 0,
     resume_path: str | Path | None = None,
+    legacy_37: bool = False,
 ) -> Path:
     """利用 MegaDepth 深度和位姿训练 v0.1 的双图语义编码器和价值头。"""
     if epochs <= 0 or learning_rate <= 0.0:
         raise ValueError("训练轮数和学习率必须为正数")
     selected_device = resolve_device(device)
     print(format_training_device(selected_device), flush=True)
-    config = PasmV0Config()
+    config = training_config(legacy_37)
     pairs = [pair for pair in load_manifest(manifest_path) if pair.label == 1]
     if max_pairs is not None:
         pairs = pairs[:max_pairs]
@@ -287,6 +293,7 @@ def main() -> None:
     parser.add_argument("--max-pairs", type=int, help="最多使用的正图像对数量")
     parser.add_argument("--seed", type=int, default=0, help="采样随机种子")
     parser.add_argument("--resume", type=Path, help="恢复指定训练检查点并训练到目标总轮数")
+    parser.add_argument("--legacy-37", action="store_true", help="使用 37×37 Patch 的旧三轮训练配置")
     args = parser.parse_args()
     output = train_model(
         args.manifest,
@@ -301,6 +308,7 @@ def main() -> None:
         args.max_pairs,
         args.seed,
         args.resume,
+        args.legacy_37,
     )
     print(output)
 

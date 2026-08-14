@@ -78,7 +78,10 @@ def load_runner(
     config_data["round_min_points"] = tuple(config_data["round_min_points"])
     config = PasmV0Config(**config_data)
     encoder = PairSemanticEncoder(
-        int(checkpoint["token_dim"]), int(checkpoint["hidden_dim"]), int(checkpoint["heads"])
+        int(checkpoint["token_dim"]),
+        int(checkpoint["hidden_dim"]),
+        int(checkpoint["heads"]),
+        int(checkpoint.get("cross_attention_layers", 1)),
     ).to(device)
     encoder.load_state_dict(checkpoint["semantic_encoder"], strict=True)
     return PasmV0(encoder.eval(), config)
@@ -191,8 +194,6 @@ def experiment_output_paths(directory: str | Path) -> ExperimentOutputPaths:
 def static_experiment_output_paths(directory: str | Path) -> StaticExperimentOutputPaths:
     """创建 v0.3 静态实验目录并返回固定输出路径。"""
     output = Path(directory)
-    if output.suffix:
-        raise ValueError("--output 必须是实验输出文件夹，不能是文件路径")
     output.mkdir(parents=True, exist_ok=True)
     return StaticExperimentOutputPaths(
         result=output / "result.npz",
@@ -229,10 +230,10 @@ def run_static_inference(
         with torch.inference_mode():
             _, _, values_a, values_b = runner.semantic_encoder(tokens_a, tokens_b)
         budget_a = allocate_patch_budget(
-            values_a[0].detach().cpu().numpy(), runner.config, round_index=2
+            values_a[0].detach().cpu().numpy(), runner.config, round_index=0
         )
         budget_b = allocate_patch_budget(
-            values_b[0].detach().cpu().numpy(), runner.config, round_index=2
+            values_b[0].detach().cpu().numpy(), runner.config, round_index=0
         )
     detector = FrozenDaDDetector(dad_weights, runner.config.image_size, selected_device)
     detections_a = detector.detect(image_a)

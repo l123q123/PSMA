@@ -94,6 +94,24 @@ class PasmV0MatchingTests(unittest.TestCase):
         self.assertEqual(tuple(value_b.shape), (1, 4))
         self.assertTrue(torch.all((value_a >= 0.0) & (value_a <= 1.0)))
 
+    def test_semantic_encoder_supports_multiple_cross_attention_ffn_layers(self) -> None:
+        """增强编码器应包含指定数量的 Cross-Attention 和非线性 FFN。"""
+        encoder = PairSemanticEncoder(token_dim=6, hidden_dim=8, heads=2, cross_attention_layers=2)
+
+        self.assertEqual(encoder.cross_attention_layers, 2)
+        self.assertEqual(len(encoder.attention_layers), 2)
+        self.assertEqual(len(encoder.ffn_layers), 2)
+        self.assertFalse(any("self_attn" in name for name, _ in encoder.named_modules()))
+
+        semantic_a, semantic_b, value_a, value_b = encoder(
+            torch.randn(1, 4, 6), torch.randn(1, 4, 6)
+        )
+
+        self.assertEqual(tuple(semantic_a.shape), (1, 4, 8))
+        self.assertEqual(tuple(semantic_b.shape), (1, 4, 8))
+        self.assertEqual(tuple(value_a.shape), (1, 4))
+        self.assertEqual(tuple(value_b.shape), (1, 4))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,17 +20,50 @@ class AnchorMatches:
 
 
 class PairSemanticEncoder(nn.Module):
-    """使用一层共享双向 Cross-Attention 条件化管理 Patch 语义。"""
+    """使用共享双向 Cross-Attention 条件化管理 Patch 语义。"""
 
-    def __init__(self, token_dim: int, hidden_dim: int = 128, heads: int = 4) -> None:
-        """创建语义投影、共享注意力层和 Patch 价值头。"""
+    def __init__(
+        self,
+        token_dim: int,
+        hidden_dim: int = 128,
+        heads: int = 4,
+        cross_attention_layers: int = 1,
+    ) -> None:
+        """创建语义投影、共享 Cross-Attention 层、非线性模块和 Patch 价值头。"""
         super().__init__()
-        if token_dim <= 0 or hidden_dim <= 0 or heads <= 0 or hidden_dim % heads:
-            raise ValueError("语义维度和注意力头数无效")
+        if (
+            token_dim <= 0
+            or hidden_dim <= 0
+            or heads <= 0
+            or hidden_dim % heads
+            or cross_attention_layers <= 0
+        ):
+            raise ValueError("语义维度、注意力头数或层数无效")
         self.projection = nn.Linear(token_dim, hidden_dim)
-        self.attention = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
+        self.cross_attention_layers = cross_attention_layers
         self.normalization = nn.LayerNorm(hidden_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
+        if cross_attention_layers == 1:
+            self.attention = nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
+        else:
+            self.attention_layers = nn.ModuleList(
+                nn.MultiheadAttention(hidden_dim, heads, batch_first=True)
+                for _ in range(cross_attention_layers)
+            )
+            self.attention_norms = nn.ModuleList(
+                nn.LayerNorm(hidden_dim) for _ in range(cross_attention_layers)
+            )
+            self.ffn_layers = nn.ModuleList(
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim * 2),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                )
+                for _ in range(cross_attention_layers)
+            )
+            self.ffn_norms = nn.ModuleList(
+                nn.LayerNorm(hidden_dim) for _ in range(cross_attention_layers)
+            )
 
     def forward(
         self, tokens_a: torch.Tensor, tokens_b: torch.Tensor
@@ -39,10 +72,30 @@ class PairSemanticEncoder(nn.Module):
         _validate_tokens(tokens_a, tokens_b)
         base_a = self.normalization(self.projection(tokens_a))
         base_b = self.normalization(self.projection(tokens_b))
-        message_a, _ = self.attention(base_a, base_b, base_b, need_weights=False)
-        message_b, _ = self.attention(base_b, base_a, base_a, need_weights=False)
-        semantic_a = functional.normalize(base_a + message_a, dim=-1, eps=1e-6)
-        semantic_b = functional.normalize(base_b + message_b, dim=-1, eps=1e-6)
+        if self.cross_attention_layers == 1:
+            message_a, _ = self.attention(base_a, base_b, base_b, need_weights=False)
+            message_b, _ = self.attention(base_b, base_a, base_a, need_weights=False)
+            semantic_a = base_a + message_a
+            semantic_b = base_b + message_b
+        else:
+            semantic_a, semantic_b = base_a, base_b
+            for attention, attention_norm, ffn, ffn_norm in zip(
+                self.attention_layers,
+                self.attention_norms,
+                self.ffn_layers,
+                self.ffn_norms,
+                strict=True,
+            ):
+                query_a = attention_norm(semantic_a)
+                query_b = attention_norm(semantic_b)
+                message_a, _ = attention(query_a, query_b, query_b, need_weights=False)
+                message_b, _ = attention(query_b, query_a, query_a, need_weights=False)
+                semantic_a = semantic_a + message_a
+                semantic_b = semantic_b + message_b
+                semantic_a = semantic_a + ffn(ffn_norm(semantic_a))
+                semantic_b = semantic_b + ffn(ffn_norm(semantic_b))
+        semantic_a = functional.normalize(semantic_a, dim=-1, eps=1e-6)
+        semantic_b = functional.normalize(semantic_b, dim=-1, eps=1e-6)
         value_a = torch.sigmoid(self.value_head(semantic_a).squeeze(-1))
         value_b = torch.sigmoid(self.value_head(semantic_b).squeeze(-1))
         return semantic_a, semantic_b, value_a, value_b

@@ -159,13 +159,185 @@ class ContrastiveDensePointFusion(nn.Module):
         return base_logits + gain * zscore - penalty
 
 
-def create_point_fusion(mode: str = "residual") -> nn.Module:
+class CandidateSuppressionFusion(nn.Module):
+    """在固定原始 DaD 候选上融合双图语义特征，并且只能降低候选分数。"""
+
+    def __init__(
+        self,
+        semantic_dim: int = 128,
+        dad_channels: int = 32,
+        hidden_dim: int = 64,
+        patch_penalty_scale: float = 1.0,
+        point_penalty_scale: float = 1.0,
+        high_quality_point_scale: float = 0.05,
+        quality_gamma: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if semantic_dim <= 0 or dad_channels <= 0 or hidden_dim <= 0:
+            raise ValueError("候选融合头通道数必须为正数")
+        if (
+            patch_penalty_scale < 0.0
+            or point_penalty_scale < 0.0
+            or high_quality_point_scale < 0.0
+            or quality_gamma <= 0.0
+        ):
+            raise ValueError("候选抑制尺度和指数必须有效")
+        self.semantic_quality_head = nn.Linear(semantic_dim, 1)
+        self.candidate_penalty_head = nn.Sequential(
+            nn.Linear(dad_channels + semantic_dim + 1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.semantic_quality_head.weight)
+        nn.init.zeros_(self.semantic_quality_head.bias)
+        nn.init.zeros_(self.candidate_penalty_head[-1].weight)
+        nn.init.zeros_(self.candidate_penalty_head[-1].bias)
+        self.patch_penalty_scale = float(patch_penalty_scale)
+        self.point_penalty_scale = float(point_penalty_scale)
+        self.high_quality_point_scale = float(high_quality_point_scale)
+        self.quality_gamma = float(quality_gamma)
+
+    def forward(
+        self,
+        dad_features: torch.Tensor,
+        base_logits: torch.Tensor,
+        semantic_tokens: torch.Tensor,
+        candidates_xy: torch.Tensor,
+        image_size: int | tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回固定候选的最终 logits 和非负抑制量，不生成新的稠密峰。"""
+        _validate_inputs(dad_features, base_logits, semantic_tokens)
+        height, width = _spatial_size(image_size)
+        if base_logits.shape[-2:] != (height, width):
+            raise ValueError("候选融合图像尺寸必须与基础 DaD logits 一致")
+        candidates = _validate_candidate_points(candidates_xy, height, width, base_logits.device, base_logits.dtype)
+        semantic = _candidate_semantic_tokens(semantic_tokens, candidates, height, width)
+        dad = _sample_dense_features(dad_features, candidates, height, width)
+        base = point_candidate_logits(base_logits, candidates, (height, width))
+        quality = torch.sigmoid(self.semantic_quality_head(semantic)).squeeze(1)
+        uncertainty = (1.0 - quality).pow(self.quality_gamma)
+        raw_penalty = F.softplus(
+            self.candidate_penalty_head(torch.cat((dad, semantic, base.unsqueeze(1)), dim=1)).squeeze(1)
+        )
+        penalty = (
+            self.patch_penalty_scale * uncertainty
+            + self.point_penalty_scale
+            * (self.high_quality_point_scale + uncertainty)
+            * raw_penalty
+        )
+        return base - penalty, penalty
+
+
+class SemanticCoverageDaDFusion(nn.Module):
+    """以 Patch 语义条件化 DaD 稠密特征，并输出完整的融合 logits 图。"""
+
+    def __init__(
+        self,
+        semantic_dim: int = 128,
+        dad_channels: int = 32,
+        hidden_channels: int = 64,
+    ) -> None:
+        super().__init__()
+        if semantic_dim <= 0 or dad_channels <= 0 or hidden_channels <= 0:
+            raise ValueError("语义覆盖融合头通道数必须为正数")
+        self.semantic_projection = nn.Linear(semantic_dim, dad_channels)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(
+                dad_channels * 2 + 1,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode="reflect",
+            ),
+            nn.GroupNorm(
+                num_groups=8 if hidden_channels % 8 == 0 else 1,
+                num_channels=hidden_channels,
+            ),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                padding_mode="reflect",
+            ),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+        )
+        self.alpha = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+
+    def forward(
+        self,
+        dad_features: torch.Tensor,
+        base_logits: torch.Tensor,
+        semantic_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """返回稠密融合 logits；初始时严格保留原始 DaD 响应。"""
+        _validate_inputs(dad_features, base_logits, semantic_tokens)
+        height, width = base_logits.shape[-2:]
+        dad = F.interpolate(dad_features, size=(height, width), mode="bilinear", align_corners=False)
+        token_count = semantic_tokens.shape[1]
+        grid = math.isqrt(token_count)
+        if grid * grid != token_count:
+            raise ValueError("语义 token 数量必须是正方形网格")
+        semantic = self.semantic_projection(semantic_tokens)
+        semantic = semantic.transpose(1, 2).reshape(semantic_tokens.shape[0], -1, grid, grid)
+        semantic = F.interpolate(semantic, size=(height, width), mode="bilinear", align_corners=False)
+        delta = self.fusion(torch.cat((dad, semantic, base_logits), dim=1))
+        return base_logits + self.alpha * delta
+
+
+class PatchGatedDaDFusion(nn.Module):
+    """仅以双图语义决定是否整体信任一个 Patch 内的原始 DaD 排序。"""
+
+    def __init__(
+        self,
+        semantic_dim: int = 128,
+        penalty_scale: float = 3.0,
+        quality_gamma: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if semantic_dim <= 0 or penalty_scale <= 0.0 or quality_gamma <= 0.0:
+            raise ValueError("Patch 门控通道数、抑制尺度和指数必须为正数")
+        self.semantic_gate_head = nn.Linear(semantic_dim, 1)
+        nn.init.zeros_(self.semantic_gate_head.weight)
+        nn.init.zeros_(self.semantic_gate_head.bias)
+        self.penalty_scale = float(penalty_scale)
+        self.quality_gamma = float(quality_gamma)
+
+    def forward(
+        self,
+        base_logits: torch.Tensor,
+        semantic_tokens: torch.Tensor,
+        candidates_xy: torch.Tensor,
+        image_size: int | tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回固定候选分数和每个 Patch 独立的 DaD 放行概率。"""
+        _validate_patch_gate_inputs(base_logits, semantic_tokens)
+        height, width = _spatial_size(image_size)
+        if base_logits.shape[-2:] != (height, width):
+            raise ValueError("Patch 门控图像尺寸必须与基础 DaD logits 一致")
+        candidates = _validate_candidate_points(candidates_xy, height, width, base_logits.device, base_logits.dtype)
+        patch_ids = _candidate_patch_ids(candidates, semantic_tokens.shape[1], height, width)
+        patch_gates = torch.sigmoid(self.semantic_gate_head(semantic_tokens[0])).squeeze(1)
+        base = point_candidate_logits(base_logits, candidates, (height, width))
+        penalty = self.penalty_scale * (1.0 - patch_gates[patch_ids]).pow(self.quality_gamma)
+        return base - penalty, patch_gates
+
+
+def create_point_fusion(mode: str = "residual", **kwargs: float) -> nn.Module:
     """根据检查点/训练配置创建指定融合头，保留 v0.5 默认残差模式。"""
     if mode == "residual":
         return DensePointFusion()
     if mode == "contrastive":
         return ContrastiveDensePointFusion()
-    raise ValueError("融合模式必须是 residual 或 contrastive")
+    if mode == "candidate_suppression":
+        return CandidateSuppressionFusion()
+    if mode == "semantic_coverage":
+        return SemanticCoverageDaDFusion()
+    if mode == "patch_gate":
+        return PatchGatedDaDFusion(**kwargs)
+    raise ValueError("融合模式必须是 residual、contrastive、candidate_suppression、semantic_coverage 或 patch_gate")
 
 
 def point_candidate_logits(
@@ -199,7 +371,10 @@ def point_candidate_logits(
 
 @torch.inference_mode()
 def select_dense_topk(
-    dense_logits: torch.Tensor, num_points: int = 1024, nms_size: int = 3
+    dense_logits: torch.Tensor,
+    num_points: int = 1024,
+    nms_size: int = 3,
+    increase_coverage: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """按 DaD 规则从融合稠密 logits 中选择归一化 Top-K 点。"""
     if dense_logits.ndim != 4 or dense_logits.shape[0] != 1 or dense_logits.shape[1] != 1:
@@ -216,13 +391,45 @@ def select_dense_topk(
         use_nms=True,
         nms_size=nms_size,
         sample_topk=True,
-        increase_coverage=False,
+        increase_coverage=increase_coverage,
         return_probs=True,
         subpixel=True,
         scoremap=dense_logits[:, 0],
         subpixel_temp=0.5,
     )
     return points[0], scores[0]
+
+
+@torch.inference_mode()
+def select_candidate_topk(
+    candidates_xy: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    num_points: int,
+    image_size: int | tuple[int, int],
+    border_margin_px: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """仅从固定原始 DaD 候选中全局选 Top-K，并可排除确定性边界带。"""
+    height, width = _spatial_size(image_size)
+    candidates = _validate_candidate_points(
+        candidates_xy, height, width, candidate_logits.device, candidate_logits.dtype
+    )
+    logits = torch.as_tensor(candidate_logits, device=candidates.device, dtype=candidates.dtype).reshape(-1)
+    if logits.shape != (len(candidates),) or not torch.isfinite(logits).all():
+        raise ValueError("候选分数必须是与候选点同长度的有限一维张量")
+    if num_points <= 0 or num_points > len(candidates) or border_margin_px < 0:
+        raise ValueError("候选 Top-K 点数或边界带宽无效")
+    inside = (
+        (candidates[:, 0] >= border_margin_px)
+        & (candidates[:, 0] < width - border_margin_px)
+        & (candidates[:, 1] >= border_margin_px)
+        & (candidates[:, 1] < height - border_margin_px)
+    )
+    valid_indices = torch.nonzero(inside, as_tuple=False).reshape(-1)
+    if len(valid_indices) < num_points:
+        raise ValueError("边界过滤后的 DaD 候选不足以选择要求数量的点")
+    ordered = valid_indices[torch.argsort(logits[valid_indices], descending=True, stable=True)]
+    selected = ordered[:num_points]
+    return candidates[selected], logits[selected]
 
 
 def _validate_inputs(
@@ -238,3 +445,89 @@ def _validate_inputs(
         raise ValueError("基础 logits 必须单通道且语义 token 必须为 128 维")
     if not torch.isfinite(dad_features).all() or not torch.isfinite(base_logits).all() or not torch.isfinite(semantic_tokens).all():
         raise ValueError("融合输入必须是有限张量")
+
+
+def _validate_patch_gate_inputs(base_logits: torch.Tensor, semantic_tokens: torch.Tensor) -> None:
+    if base_logits.ndim != 4 or semantic_tokens.ndim != 3:
+        raise ValueError("Patch 门控输入维度必须分别为 4 和 3")
+    if base_logits.shape[0] != 1 or base_logits.shape[1] != 1 or semantic_tokens.shape[:1] != (1,):
+        raise ValueError("Patch 门控仅支持单张图的单通道 DaD logits")
+    if semantic_tokens.shape[2] != 128:
+        raise ValueError("Patch 门控语义 token 必须为 128 维")
+    token_count = semantic_tokens.shape[1]
+    grid = math.isqrt(token_count)
+    if grid * grid != token_count:
+        raise ValueError("语义 token 数量必须是正方形网格")
+    if not torch.isfinite(base_logits).all() or not torch.isfinite(semantic_tokens).all():
+        raise ValueError("Patch 门控输入必须是有限张量")
+
+
+def _spatial_size(image_size: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(image_size, int):
+        height = width = image_size
+    else:
+        height, width = image_size
+    if height <= 0 or width <= 0:
+        raise ValueError("图像尺寸必须为正数")
+    return int(height), int(width)
+
+
+def _validate_candidate_points(
+    candidates_xy: torch.Tensor,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    candidates = torch.as_tensor(candidates_xy, device=device, dtype=dtype)
+    if candidates.ndim != 2 or candidates.shape[1] != 2 or candidates.shape[0] == 0:
+        raise ValueError("候选点必须具有非空 [N, 2] 形状")
+    if not torch.isfinite(candidates).all():
+        raise ValueError("候选点必须是有限坐标")
+    if torch.any(candidates[:, 0] < 0.0) or torch.any(candidates[:, 0] >= width):
+        raise ValueError("候选点 x 坐标超出图像范围")
+    if torch.any(candidates[:, 1] < 0.0) or torch.any(candidates[:, 1] >= height):
+        raise ValueError("候选点 y 坐标超出图像范围")
+    return candidates
+
+
+def _sample_dense_features(
+    feature_map: torch.Tensor,
+    candidates_xy: torch.Tensor,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    grid = candidates_xy.clone()
+    grid[:, 0] = (grid[:, 0] + 0.5) * 2.0 / width - 1.0
+    grid[:, 1] = (grid[:, 1] + 0.5) * 2.0 / height - 1.0
+    sampled = F.grid_sample(
+        feature_map,
+        grid.view(1, 1, -1, 2),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return sampled[0, :, 0].transpose(0, 1)
+
+
+def _candidate_semantic_tokens(
+    semantic_tokens: torch.Tensor,
+    candidates_xy: torch.Tensor,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    patch_ids = _candidate_patch_ids(candidates_xy, semantic_tokens.shape[1], height, width)
+    return semantic_tokens[0, patch_ids]
+
+
+def _candidate_patch_ids(
+    candidates_xy: torch.Tensor,
+    token_count: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    grid = math.isqrt(token_count)
+    if grid * grid != token_count:
+        raise ValueError("语义 token 数量必须是正方形网格")
+    cols = torch.floor(candidates_xy[:, 0] * grid / width).to(torch.long).clamp_(0, grid - 1)
+    rows = torch.floor(candidates_xy[:, 1] * grid / height).to(torch.long).clamp_(0, grid - 1)
+    return rows * grid + cols

@@ -11,6 +11,7 @@ from typing import Sequence
 import numpy as np
 
 from .backbones import load_resized_rgb, resolve_device
+from .data import load_manifest
 from .evaluate_v03 import _metric_row, load_heldout_pairs, validate_heldout_against_training
 from .geometry import load_pair_geometry
 from .infer import save_match_visualization, save_static_point_distribution, static_experiment_output_paths
@@ -41,8 +42,10 @@ def evaluate_pairs(
     fusion_checkpoint: str | Path,
     semantic_checkpoint: str | Path,
     output: str | Path,
+    adaptive_threshold_checkpoint: str | Path | None = None,
     device: str = "auto",
     max_pairs: int = 9,
+    pair_manifest: str | Path | None = None,
 ) -> Path:
     """不向 v0.5 选点器传递几何信息，只在选点后计算留出集指标。"""
     if max_pairs <= 0:
@@ -51,11 +54,12 @@ def evaluate_pairs(
     if output_root.exists() and not output_root.is_dir():
         raise ValueError("--output 必须是评测输出文件夹")
     output_root.mkdir(parents=True, exist_ok=True)
-    pairs = load_heldout_pairs(image_root)[:max_pairs]
+    pairs = (load_manifest(pair_manifest) if pair_manifest is not None else load_heldout_pairs(image_root))[:max_pairs]
     validate_heldout_against_training(pairs, training_manifest)
     selected_device = resolve_device(device)
     runner = load_v05_runner(
-        fusion_checkpoint, dino_weights, dad_weights, semantic_checkpoint, selected_device
+        fusion_checkpoint, dino_weights, dad_weights, semantic_checkpoint, selected_device,
+        adaptive_threshold_checkpoint=adaptive_threshold_checkpoint,
     )
     matcher = FrozenLoMaMatcher(loma_weights, dad_weights, dino_weights, selected_device)
     rows: list[dict[str, object]] = []
@@ -216,22 +220,26 @@ def main() -> None:
     parser.add_argument("--dad-weights", type=Path, required=True)
     parser.add_argument("--fusion-checkpoint", type=Path, required=True)
     parser.add_argument("--semantic-checkpoint", type=Path, required=True)
+    parser.add_argument("--adaptive-threshold-checkpoint", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-pairs", type=int, default=9)
+    parser.add_argument("--pair-manifest", type=Path, help="可选 MegaDepth 风格评测清单；不传则使用固定九组")
     args = parser.parse_args()
     print(
         evaluate_pairs(
-            args.image_root,
-            args.training_manifest,
-            args.dino_weights,
-            args.loma_weights,
-            args.dad_weights,
-            args.fusion_checkpoint,
-            args.semantic_checkpoint,
-            args.output,
-            args.device,
-            args.max_pairs,
+            image_root=args.image_root,
+            training_manifest=args.training_manifest,
+            dino_weights=args.dino_weights,
+            loma_weights=args.loma_weights,
+            dad_weights=args.dad_weights,
+            fusion_checkpoint=args.fusion_checkpoint,
+            semantic_checkpoint=args.semantic_checkpoint,
+            output=args.output,
+            adaptive_threshold_checkpoint=args.adaptive_threshold_checkpoint,
+            device=args.device,
+            max_pairs=args.max_pairs,
+            pair_manifest=args.pair_manifest,
         )
     )
 

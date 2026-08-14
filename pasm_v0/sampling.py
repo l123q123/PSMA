@@ -44,6 +44,15 @@ class PatchLayout:
     def initial_points(self, seed: int | None = None) -> tuple[np.ndarray, np.ndarray]:
         """在每个 Patch 内生成首轮固定数量的分层随机点。"""
         generator = np.random.default_rng(seed)
+        if self.config.initial_patch_subset:
+            patch_ids = generator.choice(
+                self.config.patch_count, size=self.config.total_points, replace=False
+            )
+            points = np.concatenate(
+                [_uniform_points(self.bounds(int(patch_id)), 1, generator) for patch_id in patch_ids],
+                axis=0,
+            )
+            return points.astype(np.float32), patch_ids.astype(np.int64)
         count = self.config.minimum_for_round(0)
         points = []
         patch_ids = []

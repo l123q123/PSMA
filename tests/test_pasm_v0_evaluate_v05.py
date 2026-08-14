@@ -107,6 +107,34 @@ class _FakeMatcher:
 
 
 class V05EvaluationTests(unittest.TestCase):
+    def test_evaluator_accepts_custom_pair_manifest(self) -> None:
+        pairs = [SimpleNamespace(pair_id=f"pair_{index}", image_a=Path("a.jpg"), image_b=Path("b.jpg")) for index in range(2)]
+        runner = _FakeV05Runner()
+        image = np.zeros((3, 16, 16), dtype=np.float32)
+
+        with TemporaryDirectory() as directory, \
+             patch("pasm_v0.evaluate_v05.load_manifest", return_value=pairs), \
+             patch("pasm_v0.evaluate_v05.validate_heldout_against_training"), \
+             patch("pasm_v0.evaluate_v05.load_v05_runner", return_value=runner), \
+             patch("pasm_v0.evaluate_v05.FrozenLoMaMatcher", return_value=_FakeMatcher()), \
+             patch("pasm_v0.evaluate_v05.load_resized_rgb", return_value=image), \
+             patch("pasm_v0.evaluate_v05.load_pair_geometry", return_value=object()), \
+             patch("pasm_v0.evaluate_v05._metric_row", side_effect=lambda index, pair_id, method, *_: {
+                 "pair_index": index, "pair_id": pair_id, "method": method, "mutual_matches": 1,
+                 "inliers_3px": 1, "inliers_6px": 1, "inlier_rate_3px": 1.0, "inlier_rate_6px": 1.0,
+                 "coverage_3px": 1.0, "coverage_6px": 1.0, "high_confidence_matches": 1,
+                 "high_confidence_inliers_3px": 1, "high_confidence_inliers_6px": 1,
+                 "high_confidence_inlier_rate_3px": 1.0, "high_confidence_inlier_rate_6px": 1.0,
+             }):
+            output = evaluate_pairs(
+                "images", "training.json", "dino.pth", "loma.pth", "dad.pth", "fusion.pt",
+                "semantic.pt", directory, pair_manifest="custom.json", device="cpu", max_pairs=9,
+            )
+
+            with (output / "summary.csv").open(encoding="utf-8", newline="") as file:
+                self.assertEqual(len(list(csv.DictReader(file))), 2)
+            self.assertEqual(runner.calls, 2)
+
     def test_evaluator_writes_nine_rows_and_budget_free_visualizations(self) -> None:
         pairs = [SimpleNamespace(pair_id=f"pair_{index}", image_a=Path("a.jpg"), image_b=Path("b.jpg")) for index in range(9)]
         runner = _FakeV05Runner()

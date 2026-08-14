@@ -180,13 +180,18 @@ def _prepare_pasm_budgets(
             _, _, values_a, values_b = runner.semantic_encoder(tokens[:1], tokens[1:])
         states.append(PairState(
             index=index, pair=pair, image_a=image_a, image_b=image_b,
-            budget_a=allocate_patch_budget(values_a[0].cpu().numpy(), runner.config, round_index=2),
-            budget_b=allocate_patch_budget(values_b[0].cpu().numpy(), runner.config, round_index=2),
+            budget_a=allocate_patch_budget(values_a[0].cpu().numpy(), runner.config, round_index=_static_budget_round(runner.config)),
+            budget_b=allocate_patch_budget(values_b[0].cpu().numpy(), runner.config, round_index=_static_budget_round(runner.config)),
         ))
     del encoder
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return states
+
+
+def _static_budget_round(config) -> int:
+    """返回静态评测应使用的最后一个有效采样轮次。"""
+    return config.iterations - 1
 
 
 def _prepare_dad_points(states: Sequence[PairState], runner, layout: PatchLayout, dad_weights: str | Path, device: torch.device) -> None:

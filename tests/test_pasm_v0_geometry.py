@@ -10,6 +10,7 @@ from pasm_v0.geometry import (
     PairGeometry,
     projected_match_targets,
     projected_patch_support_targets,
+    confirmed_invisible_projected_points,
     visible_projected_points,
 )
 from pasm_v0.sampling import PatchLayout
@@ -83,6 +84,23 @@ class PasmV0GeometryTests(unittest.TestCase):
         np.testing.assert_array_equal(indices, np.array([0], dtype=np.int64))
         np.testing.assert_allclose(projected, np.array([[4.0, 4.0]], dtype=np.float32))
 
+    def test_confirmed_invisible_projection_marks_occlusion_and_out_of_view(self) -> None:
+        occluded = confirmed_invisible_projected_points(
+            np.array([[4.0, 4.0]], dtype=np.float32),
+            self._identity_geometry(depth_b=1.0),
+            "a_to_b",
+            depth_tolerance=0.01,
+        )
+        out_of_view = confirmed_invisible_projected_points(
+            np.array([[4.0, 4.0]], dtype=np.float32),
+            self._translated_geometry(translation_x=100.0),
+            "a_to_b",
+            depth_tolerance=0.01,
+        )
+
+        np.testing.assert_array_equal(occluded, np.array([True]))
+        np.testing.assert_array_equal(out_of_view, np.array([True]))
+
     def _identity_geometry(self, depth_b: float = 2.0) -> PairGeometry:
         """构造深度一致的单位相机几何信息。"""
         depth_a = np.full((32, 32), 2.0, dtype=np.float32)
@@ -94,6 +112,21 @@ class PasmV0GeometryTests(unittest.TestCase):
             intrinsics_b=np.eye(3, dtype=np.float64),
             cam2world_a=np.eye(4, dtype=np.float64),
             cam2world_b=np.eye(4, dtype=np.float64),
+            original_size_a=(32, 32),
+            original_size_b=(32, 32),
+            image_size=32,
+        )
+
+    def _translated_geometry(self, translation_x: float) -> PairGeometry:
+        cam2world_b = np.eye(4, dtype=np.float64)
+        cam2world_b[0, 3] = translation_x
+        return PairGeometry(
+            depth_a=np.full((32, 32), 2.0, dtype=np.float32),
+            depth_b=np.full((32, 32), 2.0, dtype=np.float32),
+            intrinsics_a=np.eye(3, dtype=np.float64),
+            intrinsics_b=np.eye(3, dtype=np.float64),
+            cam2world_a=np.eye(4, dtype=np.float64),
+            cam2world_b=cam2world_b,
             original_size_a=(32, 32),
             original_size_b=(32, 32),
             image_size=32,

@@ -116,6 +116,47 @@ def visible_projected_points(
     raise ValueError("投影方向必须为 a_to_b 或 b_to_a")
 
 
+def confirmed_invisible_projected_points(
+    points: np.ndarray,
+    geometry: PairGeometry,
+    direction: Literal["a_to_b", "b_to_a"],
+    depth_tolerance: float,
+) -> np.ndarray:
+    """标记有明确几何证据不可见的源点，无法判定的点保留为 False。"""
+    source = _points(points)
+    if depth_tolerance < 0.0:
+        raise ValueError("深度误差阈值不能为负数")
+    if direction == "a_to_b":
+        return _confirmed_invisible_points(
+            source,
+            geometry.depth_a,
+            geometry.intrinsics_a,
+            geometry.cam2world_a,
+            geometry.depth_b,
+            geometry.intrinsics_b,
+            geometry.cam2world_b,
+            geometry.original_size_a,
+            geometry.original_size_b,
+            geometry.image_size,
+            depth_tolerance,
+        )
+    if direction == "b_to_a":
+        return _confirmed_invisible_points(
+            source,
+            geometry.depth_b,
+            geometry.intrinsics_b,
+            geometry.cam2world_b,
+            geometry.depth_a,
+            geometry.intrinsics_a,
+            geometry.cam2world_a,
+            geometry.original_size_b,
+            geometry.original_size_a,
+            geometry.image_size,
+            depth_tolerance,
+        )
+    raise ValueError("投影方向必须为 a_to_b 或 b_to_a")
+
+
 def projected_match_targets(
     points_a: np.ndarray,
     points_b: np.ndarray,
@@ -211,6 +252,53 @@ def projected_patch_support_targets(
         depth_tolerance,
     )
     return _patch_support(points[visible_a], layout), _patch_support(points[visible_b], layout)
+
+
+def projected_patch_support_fractions(
+    geometry: PairGeometry,
+    layout: PatchLayout,
+    stride: int,
+    depth_tolerance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """返回每个 Patch 内通过双图几何可见性检查的采样比例。"""
+    if stride <= 0 or depth_tolerance < 0.0 or layout.config.image_size != geometry.image_size:
+        raise ValueError("Patch 网格、投影步长或深度误差阈值无效")
+    axis = np.arange(0, geometry.image_size, stride, dtype=np.float32)
+    grid_y, grid_x = np.meshgrid(axis, axis, indexing="ij")
+    points = np.column_stack((grid_x.ravel(), grid_y.ravel()))
+    visible_a = _visible_projection_indices(
+        points,
+        geometry.depth_a,
+        geometry.intrinsics_a,
+        geometry.cam2world_a,
+        geometry.depth_b,
+        geometry.intrinsics_b,
+        geometry.cam2world_b,
+        geometry.original_size_a,
+        geometry.original_size_b,
+        geometry.image_size,
+        depth_tolerance,
+    )
+    visible_b = _visible_projection_indices(
+        points,
+        geometry.depth_b,
+        geometry.intrinsics_b,
+        geometry.cam2world_b,
+        geometry.depth_a,
+        geometry.intrinsics_a,
+        geometry.cam2world_a,
+        geometry.original_size_b,
+        geometry.original_size_a,
+        geometry.image_size,
+        depth_tolerance,
+    )
+    samples_per_patch = _patch_support_counts(points, layout)
+    support_a = _patch_support_counts(points[visible_a], layout)
+    support_b = _patch_support_counts(points[visible_b], layout)
+    return (
+        (support_a / np.maximum(samples_per_patch, 1.0)).astype(np.float32),
+        (support_b / np.maximum(samples_per_patch, 1.0)).astype(np.float32),
+    )
 
 
 def read_camera_metadata(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
@@ -388,14 +476,88 @@ def _project_visible_points(
     return source_indices[visible], target_pixels[visible].astype(np.float32)
 
 
+def _confirmed_invisible_points(
+    points: np.ndarray,
+    source_depth: np.ndarray,
+    source_intrinsics: np.ndarray,
+    source_cam2world: np.ndarray,
+    target_depth: np.ndarray,
+    target_intrinsics: np.ndarray,
+    target_cam2world: np.ndarray,
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+    image_size: int,
+    depth_tolerance: float,
+) -> np.ndarray:
+    """按投影失败原因区分明确不可见和无法判定的点。"""
+    confirmed = np.zeros(len(points), dtype=bool)
+    source_indices = np.arange(len(points), dtype=np.int64)
+    in_bounds = _in_model_bounds(points, image_size)
+    source_indices = source_indices[in_bounds]
+    source_pixels = points[in_bounds]
+    if len(source_pixels) == 0:
+        return confirmed
+    source_values = _nearest_depth(source_depth, source_pixels, source_size, image_size)
+    valid_depth = np.isfinite(source_values) & (source_values > 0.0)
+    source_indices = source_indices[valid_depth]
+    source_pixels = source_pixels[valid_depth]
+    source_values = source_values[valid_depth]
+    if len(source_pixels) == 0:
+        return confirmed
+    homogeneous = np.column_stack((source_pixels, np.ones(len(source_pixels), dtype=np.float64)))
+    source_xyz = (np.linalg.inv(source_intrinsics) @ homogeneous.T).T * source_values[:, None]
+    target_from_source = np.linalg.inv(target_cam2world) @ source_cam2world
+    target_xyz = source_xyz @ target_from_source[:3, :3].T + target_from_source[:3, 3]
+    projected_depth = target_xyz[:, 2]
+    valid_camera = np.isfinite(target_xyz).all(axis=1) & (projected_depth > 0.0)
+    confirmed[source_indices[~valid_camera]] = True
+    source_indices = source_indices[valid_camera]
+    target_xyz = target_xyz[valid_camera]
+    projected_depth = projected_depth[valid_camera]
+    if len(target_xyz) == 0:
+        return confirmed
+    projected = (target_intrinsics @ target_xyz.T).T
+    valid_projection = np.isfinite(projected).all(axis=1) & (projected[:, 2] != 0.0)
+    confirmed[source_indices[~valid_projection]] = True
+    source_indices = source_indices[valid_projection]
+    projected_depth = projected_depth[valid_projection]
+    projected = projected[valid_projection]
+    if len(projected) == 0:
+        return confirmed
+    target_pixels = projected[:, :2] / projected[:, 2:3]
+    in_target = _in_model_bounds(target_pixels, image_size)
+    confirmed[source_indices[~in_target]] = True
+    source_indices = source_indices[in_target]
+    projected_depth = projected_depth[in_target]
+    target_pixels = target_pixels[in_target]
+    if len(target_pixels) == 0:
+        return confirmed
+    observed_depth = _bilinear_depth(target_depth, target_pixels, target_size, image_size)
+    known_depth = np.isfinite(observed_depth) & (observed_depth > 0.0)
+    mismatch = known_depth & (
+        np.abs(projected_depth - observed_depth)
+        > depth_tolerance * np.maximum(observed_depth, 1e-6)
+    )
+    confirmed[source_indices[mismatch]] = True
+    return confirmed
+
+
 def _patch_support(points: np.ndarray, layout: PatchLayout) -> np.ndarray:
     """将可见源点的空间覆盖度转换为归一化 Patch 分布。"""
+    support = _patch_support_counts(points, layout)
+    if not np.any(support):
+        return support
+    return support / support.sum()
+
+
+def _patch_support_counts(points: np.ndarray, layout: PatchLayout) -> np.ndarray:
+    """统计规则点在各 Patch 内的数量，不做全图归一化。"""
     support = np.zeros(layout.config.patch_count, dtype=np.float32)
     if len(points) == 0:
         return support
     patch_ids = layout.patch_ids(points)
     support += np.bincount(patch_ids, minlength=layout.config.patch_count).astype(np.float32)
-    return support / support.sum()
+    return support
 
 
 def _nearest_depth(

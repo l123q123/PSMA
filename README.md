@@ -13,6 +13,106 @@ v0.3 取消三轮锚点、反馈和重采样，改为一次静态推理：PASM �
 
 这两个模式都只运行一次选点和一次 LoMa 匹配，因而可以直接比较“联合 Patch 预算”本身的作用。v0.3 不需要重新训练，复用已有的 PASM 检查点；完整 LoMa-B128 使用 `dedode_b` 的 128 维局部描述子和 256 维匹配 Transformer，并依赖本地 DINOv2 权重。
 
+## v0.4：DINO 原始 37×37 Patch 的监督消融
+
+v0.4 保持当前一层双向 Cross-Attention 编码器不变，只把管理网格改为 DINOv2 的原始 `37×37` token 网格。每个 Patch 约对应 `14×14` 像素；每图总预算仍为 `1024`，每个 Patch 预算为 `0～4`。选点逻辑复用 v0.3：先由双图 Patch 价值分配预算，再由冻结 DaD 在每个 Patch 内按预算选点，最后由冻结完整 LoMa 匹配。
+
+这次只比较 Patch 价值监督真值：
+
+- `geometry`：`stride=2` 的深度和位姿几何共同可见性；
+- `quality`：`stride=2` 的几何可见性与 LoMa 正负描述子差值形成的质量教师。
+
+训练时不会调用完整 LoMa Transformer 反向传播，而是在 DaD 实际选出的点上读取冻结 LoMa 稠密描述子，用现有可微的局部描述子加双图语义边权计算 `L_match`；价值头使用对应缓存计算 `L_value`。两组训练除 `target_kind` 外完全一致。
+
+### 生成几何 Patch 目标缓存
+
+```powershell
+Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0\.worktrees\v0.3-pasm-dad-static'
+& 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.cache_v04_targets `
+  --manifest 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
+  --output '.\outputs\v0.4_ablation\targets_geometry_stride2' `
+  --target-kind geometry `
+  --device cuda
+```
+
+### 生成 LoMa 质量 Patch 目标缓存
+
+这一步是离线计算，使用每隔 2 个像素的密集网格，耗时会明显高于 geometry 缓存，但只需生成一次。
+
+```powershell
+Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0\.worktrees\v0.3-pasm-dad-static'
+& 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.cache_v04_targets `
+  --manifest 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
+  --output '.\outputs\v0.4_ablation\targets_quality_stride2' `
+  --target-kind quality `
+  --loma-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth' `
+  --device cuda
+```
+
+### 训练两组 v0.4 模型
+
+先各运行 `--epochs 1` 检查连通性，确认无误后把轮数改为 `20`。
+
+```powershell
+Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0\.worktrees\v0.3-pasm-dad-static'
+& 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.train_v04 `
+  --manifest 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
+  --dino-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dinov2_vitl14_pretrain.pth' `
+  --loma-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth' `
+  --dad-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dad.pth' `
+  --target-cache '.\outputs\v0.4_ablation\targets_geometry_stride2' `
+  --target-kind geometry `
+  --output '.\outputs\v0.4_ablation\geometry_20.pt' `
+  --epochs 20 `
+  --device cuda `
+  --seed 0
+```
+
+质量教师模型只需将上面命令中的 `target-cache`、`target-kind` 和 `output` 改为：
+
+```text
+--target-cache .\outputs\v0.4_ablation\targets_quality_stride2
+--target-kind quality
+--output .\outputs\v0.4_ablation\quality_20.pt
+```
+
+若继续训练到 60 轮，使用 `.last.pt` 而不是最佳 checkpoint：
+
+```powershell
+& 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.train_v04 `
+  --manifest 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
+  --dino-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dinov2_vitl14_pretrain.pth' `
+  --loma-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth' `
+  --dad-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dad.pth' `
+  --target-cache '.\outputs\v0.4_ablation\targets_geometry_stride2' `
+  --target-kind geometry `
+  --output '.\outputs\v0.4_ablation\geometry_20.pt' `
+  --resume '.\outputs\v0.4_ablation\geometry_20.last.pt' `
+  --epochs 60 `
+  --device cuda `
+  --seed 0
+```
+
+质量教师续训时只需同步替换 `target-cache`、`target-kind`、`output` 和 `resume` 路径。
+
+### 统一评测 A/B
+
+```powershell
+& 'D:\anaconda3\envs\loma\python.exe' -m pasm_v0.evaluate_v04 `
+  --image-root 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\extracted\0285\0' `
+  --training-manifest 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json' `
+  --dino-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dinov2_vitl14_pretrain.pth' `
+  --loma-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth' `
+  --dad-weights 'C:\Users\HP\.cache\torch\hub\checkpoints\dad.pth' `
+  --checkpoint-geometry '.\outputs\v0.4_ablation\geometry_20.pt' `
+  --checkpoint-quality '.\outputs\v0.4_ablation\quality_20.pt' `
+  --output '.\outputs\v0.4_ablation\heldout_eval' `
+  --max-pairs 9 `
+  --device cuda
+```
+
+评测输出包括 `summary.csv`、`aggregate.csv`、两种监督各自的 Patch 预算热图、DaD 选点图和 LoMa 匹配图。
+
 ### v0.3 推理命令
 
 ```powershell
@@ -162,3 +262,112 @@ Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0'
 - `round_budget_a`、`round_budget_b`：三轮的每 Patch 预算；
 - `round_points_a`、`round_points_b`：三轮的全部采样点坐标；
 - `round_anchor_count_a`、`round_anchor_count_b`：每轮每个 Patch 被原样保留的锚点数。
+
+## v0.6 候选抑制融合头
+
+`candidate_suppression` 不再让融合头生成一张新的稠密响应图。它先固定原始 DaD 的 3×3 NMS 候选池，再在每个候选处融合 DaD 的 32 维特征、原始 DaD logit 和双图语义 token；融合头只输出非负抑制量，因此最终候选分数只能低于或等于原始 DaD 分数。训练中，几何可见且在另一图邻近 DaD 候选的点作为正样本保留；可见但没有邻近候选的点作为负样本压低；无法可靠投影的点不参与损失。推理时固定排除图像四周 `8px` 边界带，避免边界伪响应进入最终 Top-1024。
+
+```powershell
+Set-Location 'D:\研0新方向\论文调研\Loma实验\PASM-v0\.worktrees\v0.3-pasm-dad-static'
+$py = 'D:\anaconda3\envs\loma\python.exe'
+$manifest = 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\manifests\demo_pairs.json'
+$dino = 'C:\Users\HP\.cache\torch\hub\checkpoints\dinov2_vitl14_pretrain.pth'
+$dad = 'C:\Users\HP\.cache\torch\hub\checkpoints\dad.pth'
+$semantic = 'D:\研0新方向\论文调研\Loma实验\PASM-v0\outputs\pasm_v0_1024\main_6px_1024_60.pt'
+
+& $py -m pasm_v0.train_v05 `
+  --manifest $manifest `
+  --dino-weights $dino `
+  --dad-weights $dad `
+  --semantic-checkpoint $semantic `
+  --output 'outputs\v0.6_ablation\candidate_suppression_16_main6.pt' `
+  --epochs 20 `
+  --learning-rate 1e-4 `
+  --patch-grid 16 `
+  --fusion-mode candidate_suppression `
+  --teacher-candidate-count 4096 `
+  --teacher-sigma-px 3.0 `
+  --teacher-search-radius-px 12.0 `
+  --suppression-weight 1.0 `
+  --suppression-margin 1.0 `
+  --ranking-weight 0.5 `
+  --ranking-mode soft_pairwise `
+  --border-margin-px 8 `
+  --device cuda
+```
+
+完成训练后，固定九组评测：
+
+```powershell
+$loma = 'C:\Users\HP\.cache\torch\hub\checkpoints\loma_B128.pth'
+$images = 'D:\研0新方向\论文调研\Loma实验\LoMa-main\LoMa-main\datasets\megadepth_mini\extracted\0285\0'
+
+& $py -m pasm_v0.evaluate_v05 `
+  --image-root $images `
+  --training-manifest $manifest `
+  --dino-weights $dino `
+  --loma-weights $loma `
+  --dad-weights $dad `
+  --fusion-checkpoint 'outputs\v0.6_ablation\candidate_suppression_16_main6.pt' `
+  --semantic-checkpoint $semantic `
+  --output 'outputs\v0.6_ablation\eval_candidate_suppression_16_main6' `
+  --max-pairs 9 `
+  --device cuda
+```
+
+### v0.6 Patch 门控 DaD
+
+`patch_gate` 仅判断每个双图 Patch 是否应整体信任原始 DaD；它不再生成稠密响应，也不改变同一 Patch 内的 DaD 排序。训练时，对每个 Patch 取其可靠可见 DaD 候选几何教师的最大值；推理时低门控 Patch 的所有候选统一降分，再从固定候选池全局 Top-1024。
+
+```powershell
+& $py -m pasm_v0.train_v05 `
+  --manifest $manifest `
+  --dino-weights $dino `
+  --dad-weights $dad `
+  --semantic-checkpoint $semantic `
+  --output 'outputs\v0.6_ablation\patch_gate_16_main6.pt' `
+  --epochs 20 `
+  --learning-rate 1e-4 `
+  --patch-grid 16 `
+  --fusion-mode patch_gate `
+  --teacher-candidate-count 4096 `
+  --teacher-sigma-px 3.0 `
+  --teacher-search-radius-px 12.0 `
+  --gate-penalty-scale 3.0 `
+  --gate-quality-gamma 2.0 `
+  --border-margin-px 8 `
+  --device cuda
+```
+
+### v0.6 语义覆盖、DaD 局部保真融合
+
+`semantic_coverage` 在固定原始 DaD NMS 候选上直接融合 Patch 双图语义 token、DaD 32 通道像素特征和原始 DaD logit。它不使用 Patch 预算、每 Patch 点数上限或推理阈值：推理仍对融合后的固定候选做全局 Top-1024。
+
+训练损失由四部分组成：原有候选几何 BCE 与排序损失保证跨图匹配质量；`coverage` 项让几何上有可靠支持的共同可见 Patch 不会在最终点集中完全漏选；`local preservation` 项保持可靠 Patch 内融合前后的 DaD 相对排序；`invisibility` 项只压制“含 DaD 候选但没有任何几何可见候选”的完整 Patch 所获得的 Soft Top-K 占用。混合可见边界 Patch 不受该项约束。因此语义主要影响区域间竞争，DaD 主要决定区域内选哪个具体像素点。
+
+```powershell
+& $py -m pasm_v0.train_v05 `
+  --manifest $manifest `
+  --dino-weights $dino `
+  --dad-weights $dad `
+  --semantic-checkpoint $semantic `
+  --output 'outputs\v0.6_ablation\semantic_coverage_16_main6.pt' `
+  --epochs 20 `
+  --learning-rate 1e-4 `
+  --patch-grid 16 `
+  --fusion-mode semantic_coverage `
+  --teacher-candidate-count 4096 `
+  --teacher-sigma-px 3.0 `
+  --teacher-search-radius-px 12.0 `
+  --ranking-weight 0.5 `
+  --ranking-mode soft_pairwise `
+  --coverage-weight 1.0 `
+  --local-preservation-weight 0.25 `
+  --coverage-temperature 0.5 `
+  --coverage-topk 1024 `
+  --invisibility-weight 1.0 `
+  --border-margin-px 8 `
+  --device cuda
+```
+
+`--coverage-temperature` 与 `--coverage-topk` 只用于训练中构造可微的 Soft Top-K 代理；`--invisibility-weight` 也仅训练使用，且只惩罚完全没有几何可见候选的 Patch。它们都不会进入推理选点逻辑；推理始终使用固定候选池和全局 Top-1024。

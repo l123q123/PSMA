@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 
-from pasm_v0.config import PasmV0Config
+from pasm_v0.config import PasmV0Config, dino_token_static_config
 from pasm_v0.infer import (
     experiment_output_paths,
     load_runner,
@@ -23,7 +23,7 @@ from pasm_v0.infer import (
 )
 from pasm_v0.matching import PairSemanticEncoder
 from pasm_v0.pipeline import PasmV0, RoundRecord
-from pasm_v0.train import format_training_device, format_training_progress
+from pasm_v0.train import format_training_device, format_training_progress, training_config
 from pasm_v0.visualize_quality_teacher import (
     build_argument_parser,
     save_match_comparison,
@@ -122,6 +122,16 @@ class PasmV0CliTests(unittest.TestCase):
         """训练启动信息应明确显示实际使用的设备。"""
         self.assertEqual(format_training_device("cuda"), "训练设备：cuda")
 
+    def test_legacy_37_flag_selects_original_three_round_config(self) -> None:
+        """旧训练命令的开关应只切换到 37×37 三轮配置。"""
+        config = training_config(legacy_37=True)
+
+        self.assertEqual((config.patch_rows, config.patch_cols), (37, 37))
+        self.assertEqual(config.total_points, 1024)
+        self.assertEqual(config.iterations, 3)
+        self.assertTrue(config.initial_patch_subset)
+        self.assertFalse(training_config(legacy_37=False).initial_patch_subset)
+
     def test_training_command_exposes_resume_argument(self) -> None:
         """训练命令应提供从已有检查点继续训练的参数。"""
         script = Path(__file__).parents[1] / "pasm_v0" / "train.py"
@@ -180,6 +190,16 @@ class PasmV0CliTests(unittest.TestCase):
             self.assertEqual(paths.high_confidence_matches.name, "high_confidence_matches.png")
             self.assertTrue(paths.result.parent.is_dir())
 
+    def test_static_experiment_output_directory_allows_image_named_directory(self) -> None:
+        """评测图像对目录包含 .jpg.jpg 时仍必须能正常创建。"""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "01_first.jpg.jpg__second.jpg.jpg"
+
+            paths = static_experiment_output_paths(output)
+
+            self.assertTrue(output.is_dir())
+            self.assertEqual(paths.result, output / "result.npz")
+
     def test_dad_global_skips_pasm_semantic_budget_extraction(self) -> None:
         """全局 DaD 基线不应加载 DINO 或执行 PASM 语义预算。"""
         runner = PasmV0(PairSemanticEncoder(token_dim=4, hidden_dim=4, heads=2), PasmV0Config())
@@ -222,6 +242,59 @@ class PasmV0CliTests(unittest.TestCase):
                     "cpu",
                 )
             self.assertTrue(result.is_file())
+
+    def test_pasm_dad_uses_first_round_budget_for_single_round_checkpoint(self) -> None:
+        """单轮 v0.4 checkpoint 必须按第 1 轮分配静态预算。"""
+        runner = PasmV0(
+            PairSemanticEncoder(token_dim=4, hidden_dim=4, heads=2),
+            dino_token_static_config(),
+        )
+        image = np.zeros((3, 16, 16), dtype=np.float32)
+        points = np.array([[1.5, 1.5], [2.5, 2.5]], dtype=np.float32)
+        patch_ids = np.array([0, 1], dtype=np.int64)
+        detector = MagicMock()
+        detector.detect.return_value = object()
+        matcher = MagicMock()
+        matcher.match.return_value = (
+            np.array([0, 1], dtype=np.int64),
+            np.array([0, 1], dtype=np.int64),
+            np.array([0.9, 0.8], dtype=np.float32),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("pasm_v0.infer.resolve_device", return_value=torch.device("cpu")),
+                patch("pasm_v0.infer.load_runner", return_value=runner),
+                patch("pasm_v0.infer.load_resized_rgb", side_effect=[image, image]),
+                patch(
+                    "pasm_v0.infer._extract_patch_tokens",
+                    return_value=(torch.randn(1, 1369, 4), torch.randn(1, 1369, 4)),
+                ),
+                patch("pasm_v0.infer.allocate_patch_budget", return_value=np.zeros(1369, dtype=np.int64)) as allocate,
+                patch("pasm_v0.infer.FrozenDaDDetector", return_value=detector),
+                patch(
+                    "pasm_v0.infer.select_patch_budgeted_points",
+                    side_effect=[
+                        (points, patch_ids, np.array([0.7, 0.6])),
+                        (points, patch_ids, np.array([0.7, 0.6])),
+                    ],
+                ),
+                patch("pasm_v0.infer.FrozenLoMaMatcher", return_value=matcher),
+            ):
+                result = run_static_inference(
+                    "image_a.jpg",
+                    "image_b.jpg",
+                    "dino.pth",
+                    "loma.pth",
+                    "checkpoint.pt",
+                    Path(directory) / "pasm_dad",
+                    "pasm_dad",
+                    "dad.pth",
+                    "cpu",
+                )
+            self.assertTrue(result.is_file())
+
+        self.assertEqual([call.kwargs["round_index"] for call in allocate.call_args_list], [0, 0])
 
 
     def test_round_anchor_counts_follow_recorded_patch_ids(self) -> None:

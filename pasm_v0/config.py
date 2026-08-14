@@ -25,6 +25,7 @@ class PasmV0Config:
     geometry_match_threshold_px: float = 6.0
     geometry_depth_tolerance: float = 0.01
     geometry_support_stride: int = 4
+    initial_patch_subset: bool = False
 
     def __post_init__(self) -> None:
         """验证配置能产生符合 v0 约束的采样预算。"""
@@ -51,8 +52,12 @@ class PasmV0Config:
             or self.geometry_support_stride <= 0
         ):
             raise ValueError("扰动、温度和阈值参数无效")
-        if self.total_points != self.patch_count * self.round_min_points[0]:
+        if self.round_min_points[0] and self.total_points != self.patch_count * self.round_min_points[0]:
             raise ValueError("首轮总点数必须等于 Patch 数乘以首轮最低点数")
+        if self.initial_patch_subset and not (
+            self.minimum_for_round(0) == 0 and self.total_points <= self.patch_count
+        ):
+            raise ValueError("首轮 Patch 子集采样要求首轮最低点数为零且总点数不超过 Patch 数")
         if self.total_points > self.patch_count * self.max_points_per_patch:
             raise ValueError("Patch 点数上限无法容纳总点数")
         if any(self.total_points < self.patch_count * value for value in self.round_min_points):
@@ -68,3 +73,35 @@ class PasmV0Config:
         if not 0 <= round_index < self.iterations:
             raise ValueError("轮次索引超出范围")
         return self.round_min_points[round_index]
+
+
+def dino_token_static_config(patch_grid: int = 37) -> PasmV0Config:
+    """返回使用指定 DINO token 网格的单轮静态配置。"""
+    if patch_grid not in (16, 37):
+        raise ValueError("静态 Patch 网格只支持 16 或 37")
+    return PasmV0Config(
+        patch_rows=patch_grid,
+        patch_cols=patch_grid,
+        total_points=1024,
+        iterations=1,
+        round_min_points=(0,),
+        max_points_per_patch=20 if patch_grid == 16 else 4,
+        budget_score_power=1.0,
+        geometry_support_stride=2,
+    )
+
+
+def legacy_iterative_37_config() -> PasmV0Config:
+    """返回 37×37 首轮无放回采样的旧版三轮配置。"""
+    return PasmV0Config(
+        patch_rows=37,
+        patch_cols=37,
+        total_points=1024,
+        iterations=3,
+        round_min_points=(0, 0, 0),
+        max_points_per_patch=20,
+        budget_score_power=2.0,
+        geometry_match_threshold_px=6.0,
+        geometry_support_stride=2,
+        initial_patch_subset=True,
+    )
