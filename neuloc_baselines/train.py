@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -16,7 +18,7 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from neuloc_lvsm.checkpoint import load_full_ray_initialization, load_partial_checkpoint
 from neuloc_lvsm.data import EpisodeDataset
-from neuloc_lvsm.evaluate import predict
+from neuloc_lvsm.evaluate import predict, pose_metrics
 from neuloc_lvsm.model import LVSMNeuLoc
 from neuloc_lvsm.model_diffusion import RayDiffusionNeuLoc
 from neuloc_lvsm.solver import solve_car_pose
@@ -33,8 +35,13 @@ def _batch_scalar(batch: dict[str, torch.Tensor], key: str, fallback: int | None
         raise ValueError(f"mixed {key} values in one batch are not supported yet")
     return int(values[0])
 
-def _progress_postfix_train(loss: float, avg_loss: float) -> dict[str, str]:
-    return {"loss": f"{loss:.4f}", "avg_loss": f"{avg_loss:.4f}"}
+def _progress_postfix_train(loss: float, avg_loss: float, *, rotation_deg=None, center_error=None) -> dict[str, str]:
+    result = {"loss": f"{loss:.4f}", "avg_loss": f"{avg_loss:.4f}"}
+    if rotation_deg is not None:
+        result["denoise_rot"] = f"{rotation_deg:.3f}deg"
+    if center_error is not None:
+        result["denoise_center"] = f"{center_error:.4f}"
+    return result
 
 
 def _progress_postfix_val(metrics: dict[str, float]) -> dict[str, str]:
@@ -205,6 +212,18 @@ def stage_indices(dataset: EpisodeDataset, max_episodes: int = 0) -> dict[str, l
     return grouped
 
 
+def fixed_training_probe(dataset: EpisodeDataset, per_stage: int) -> EpisodeDataset:
+    if per_stage <= 0:
+        raise ValueError("probe count must be positive")
+    probe = copy.copy(dataset)
+    selected = []
+    for indices in stage_indices(dataset).values():
+        positions = torch.linspace(0, len(indices) - 1, min(per_stage, len(indices))).long().tolist() if indices else []
+        selected.extend(indices[i] for i in positions)
+    probe.episodes = [dataset.episodes[i] for i in selected]
+    return probe
+
+
 def stagewise_validation_score(metrics_by_stage: dict[str, dict[str, float]]) -> float:
     """Give each present stage equal weight when selecting a checkpoint."""
     scores = [validation_score(metrics) for stage, metrics in metrics_by_stage.items() if metrics and stage in STAGE_ORDER]
@@ -238,9 +257,12 @@ def evaluate_validation(
         progress = tqdm(loader, total=(len(rank_indices) + batch_size - 1) // batch_size,
                          desc=f"{desc} [{stage}]", dynamic_ncols=True, leave=True,
                          disable=local_rank != 0)
-        for batch in progress:
+        for batch_index, batch in enumerate(progress):
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-            _, _, metrics = predict(model, batch, image_size, diffusion_steps=diffusion_sample_steps)
+            # Evaluation does not consume the training RNG; sample seeds are stable across epochs.
+            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+                torch.manual_seed(20261015 + rank_indices[batch_index * batch_size])
+                _, _, metrics = predict(model, batch, image_size, diffusion_steps=diffusion_sample_steps)
             n = int(batch["query_pose"].shape[0])
             sums += torch.tensor([float(metrics[key]) * n for key in METRIC_KEYS], device=device, dtype=torch.float64)
             count += n
@@ -279,6 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", help="model checkpoint from which to continue training")
     parser.add_argument("--full-lvsm-ray", action="store_true")
     parser.add_argument("--ray-diffusion", action="store_true", help="replace direct ray regression with conditional ray diffusion")
+    parser.add_argument("--no-z", action="store_true", help="keep encoded per-support tokens instead of the unified Z bottleneck")
+    parser.add_argument("--seed", type=int, default=20261015)
+    parser.add_argument("--train-probe-per-stage", type=int, default=0, help="fixed training episodes per stage evaluated by pure-noise sampling")
     parser.add_argument("--diffusion-layers", type=int, default=4)
     parser.add_argument("--diffusion-train-steps", type=int, default=50)
     parser.add_argument("--diffusion-sample-steps", type=int, default=16)
@@ -319,6 +344,9 @@ def main() -> None:
     parser = build_parser()
     args = apply_full_lvsm_ray_preset(parser.parse_args())
     validate_training_args(args)
+    if args.train_probe_per_stage < 0:
+        raise ValueError("training probe count must be non-negative")
+    torch.manual_seed(args.seed)
     configure_cuda_performance()
     ddp, local_rank, world_size = _init_ddp(args.ddp_timeout_minutes)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -326,6 +354,7 @@ def main() -> None:
     dataset = EpisodeDataset(args.manifest, image_size=args.image_size, support_views=args.support_views, max_support_views=max_support_views)
     val_dataset = EpisodeDataset(args.val_manifest, image_size=args.image_size, support_views=args.support_views, max_support_views=max_support_views) if args.val_manifest else None
     unseen_val_dataset = EpisodeDataset(args.unseen_val_manifest, image_size=args.image_size, support_views=args.support_views, max_support_views=max_support_views) if args.unseen_val_manifest else None
+    train_probe = fixed_training_probe(dataset, args.train_probe_per_stage) if args.train_probe_per_stage else None
     sampler = DistributedSampler(dataset, shuffle=True) if ddp else None
     loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, shuffle=sampler is None, **train_loader_kwargs(args.num_workers))
     model_class = RayDiffusionNeuLoc if args.ray_diffusion else LVSMNeuLoc
@@ -341,6 +370,7 @@ def main() -> None:
         relative_pose=args.relative_pose,
         relative_robust_center_scale=args.relative_robust_center_scale,
         local_refinement=args.local_refinement,
+        no_z=args.no_z,
     )
     if args.ray_diffusion:
         model_kwargs.update(
@@ -380,6 +410,8 @@ def main() -> None:
             )
     inherited, new = [], []
     for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
         (new if name.startswith(("query_tokenizer", "direction_head", "moment_head", "token_type_embedding", "view_token_pools", "diffusion_", "relative_")) else inherited).append(parameter)
     optimizer = torch.optim.AdamW([{"params": inherited, "lr": args.lr}, {"params": new, "lr": args.new_lr}], weight_decay=0.05)
     # Token-budget episodes activate only the pooling branch used by the
@@ -392,6 +424,9 @@ def main() -> None:
     output_dir = Path(args.output)
     if local_rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "run_config.json").write_text(json.dumps(vars(args), indent=2) + "\n")
+        print(f"train_episodes={len(dataset)} seen_episodes={len(val_dataset) if val_dataset else 0} unseen_episodes={len(unseen_val_dataset) if unseen_val_dataset else 0} no_z={args.no_z} world_size={world_size}", flush=True)
+    torch.manual_seed(args.seed + local_rank)
     global_step = 0
     for epoch in range(start_epoch, start_epoch + args.epochs):
         if sampler:
@@ -399,11 +434,14 @@ def main() -> None:
         wrapped.train()
         epoch_loss_sum = 0.0
         epoch_steps = 0
+        train_pose_sums = torch.zeros(3, device=device, dtype=torch.float64)
         progress = tqdm(
             enumerate(loader), total=len(loader), desc=f"Train epoch {epoch}",
             dynamic_ncols=True, leave=True, disable=local_rank != 0,
         )
         for step, batch in progress:
+            if epoch == start_epoch and step == 0 and local_rank == 0:
+                print(f"first_batch_shapes={ {k: list(v.shape) for k, v in batch.items()} }", flush=True)
             batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
             amp_enabled = args.amp_dtype == "bf16"
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
@@ -461,14 +499,22 @@ def main() -> None:
                         + args.relative_pose_loss_weight * relative_loss
                     )
             optimizer.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("non-finite training loss")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(wrapped.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(wrapped.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
+            with torch.no_grad():
+                metrics = pose_metrics(pose.rotation.detach().float(), pose.center.detach().float(), batch["query_pose"])
+                count = batch["query_pose"].shape[0]
+                train_pose_sums += train_pose_sums.new_tensor([metrics["rotation_deg"] * count, metrics["center_error"] * count, count])
             epoch_loss_sum += loss.detach().item()
             epoch_steps += 1
             if local_rank == 0:
                 progress.set_postfix(**_progress_postfix_train(
-                    loss.item(), epoch_loss_sum / epoch_steps
+                    loss.item(), epoch_loss_sum / epoch_steps,
+                    rotation_deg=float(train_pose_sums[0] / train_pose_sums[2]),
+                    center_error=float(train_pose_sums[1] / train_pose_sums[2]),
                 ))
             global_step += 1
             if args.max_steps and global_step >= args.max_steps:
@@ -478,6 +524,7 @@ def main() -> None:
                 [epoch_loss_sum, float(epoch_steps)], device=device, dtype=torch.float64
             )
             dist.all_reduce(epoch_stats, op=dist.ReduceOp.SUM)
+            dist.all_reduce(train_pose_sums, op=dist.ReduceOp.SUM)
             dist.barrier()
         else:
             epoch_stats = torch.tensor(
@@ -489,7 +536,13 @@ def main() -> None:
                 "model": model.state_dict(),
                 "epoch": epoch,
                 "loss": float(epoch_stats[0] / epoch_stats[1].clamp_min(1.0)),
+                "train_denoise_metrics": {
+                    "rotation_deg": float(train_pose_sums[0] / train_pose_sums[2]),
+                    "center_error": float(train_pose_sums[1] / train_pose_sums[2]),
+                },
                 "model_config": {
+                    "no_z": args.no_z,
+                    "seed": args.seed,
                     "ray_diffusion": args.ray_diffusion,
                     "diffusion_layers": args.diffusion_layers,
                     "diffusion_train_steps": args.diffusion_train_steps,
@@ -500,11 +553,21 @@ def main() -> None:
                     "local_refinement": args.local_refinement,
                 },
             }
+            print(f"epoch={epoch} train_denoise_metrics={checkpoint['train_denoise_metrics']}", flush=True)
             if checkpoint["loss"] < best_epoch_loss:
                 best_epoch_loss = checkpoint["loss"]
                 torch.save(checkpoint, output_dir / "trainbest.pt")
                 print(f"epoch={epoch} trainbest={best_epoch_loss:.6f}", flush=True)
         # All ranks must run validation because it contains collective all_reduce calls.
+        if train_probe is not None and (epoch + 1) % args.val_every == 0:
+            probe_metrics, probe_by_stage = evaluate_validation(
+                model, train_probe, device, args.image_size, desc=f"Train pure-noise probe epoch {epoch}",
+                ddp=ddp, local_rank=local_rank, world_size=world_size,
+                diffusion_sample_steps=args.diffusion_sample_steps if args.ray_diffusion else 0,
+            )
+            if local_rank == 0:
+                checkpoint["train_pure_noise_metrics"] = probe_metrics
+                checkpoint["train_pure_noise_metrics_by_stage"] = probe_by_stage
         if (val_dataset is not None or unseen_val_dataset is not None) and (epoch + 1) % args.val_every == 0:
             if val_dataset is not None:
                 seen_metrics, seen_by_stage = evaluate_validation(
@@ -542,6 +605,9 @@ def main() -> None:
                         torch.save(checkpoint, output_dir / "unseenbest.pt")
                         print(f"epoch={epoch} unseen_valbest={best_unseen_score:.6f}", flush=True)
         if local_rank == 0:
+            history = {k: v for k, v in checkpoint.items() if k != "model"}
+            with (output_dir / "metrics.jsonl").open("a") as stream:
+                stream.write(json.dumps(history) + "\n")
             torch.save(checkpoint, output_dir / "last.pt")
         if ddp:
             dist.barrier()

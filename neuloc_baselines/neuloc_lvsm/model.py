@@ -106,6 +106,7 @@ class LVSMNeuLoc(nn.Module):
         relative_pose: bool = False,
         relative_robust_center_scale: float = 0.25,
         local_refinement: bool = False,
+        no_z: bool = False,
     ) -> None:
         super().__init__()
         if image_size % patch_size or dim % heads or latent_count <= 0:
@@ -116,6 +117,7 @@ class LVSMNeuLoc(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.relative_pose_enabled = bool(relative_pose)
         self.local_refinement_enabled = bool(local_refinement)
+        self.no_z_enabled = bool(no_z)
         if relative_robust_center_scale <= 0:
             raise ValueError("relative_robust_center_scale must be positive")
         self.relative_robust_center_scale = float(relative_robust_center_scale)
@@ -125,6 +127,9 @@ class LVSMNeuLoc(nn.Module):
         self.query_tokenizer = nn.Linear(patch_dim, dim, bias=False)
         self.token_type_embedding = nn.Embedding(3, dim)
         self.latent_tokens = nn.Parameter(torch.randn(latent_count, dim) * 0.02)
+        # Retain the tensor for strict baseline checkpoint loading, not for computation.
+        if self.no_z_enabled:
+            self.latent_tokens.requires_grad_(False)
         self.encoder = nn.ModuleList([QKNormTransformerBlock(dim, heads) for _ in range(encoder_layers)])
         self.decoder = nn.ModuleList([QKNormTransformerBlock(dim, heads) for _ in range(decoder_layers)])
         self.decoder_norm = nn.LayerNorm(dim)
@@ -186,6 +191,7 @@ class LVSMNeuLoc(nn.Module):
         view_token_count: int | None = None,
         support_token_budget: int | None = None,
         return_view_features: bool = False,
+        return_memory_mask: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if support_images.ndim != 5 or support_intrinsics.ndim != 4 or support_poses.ndim != 4:
             raise ValueError("invalid support tensor ranks")
@@ -235,21 +241,35 @@ class LVSMNeuLoc(nn.Module):
             if pad:
                 image_tokens = F.pad(image_tokens, (0, 0, 0, pad))
                 support_valid = F.pad(support_valid, (0, pad), value=False)
-        latent = self.latent_tokens.unsqueeze(0).expand(b, -1, -1)
-        token_mask = torch.cat(
-            (
-                torch.ones((b, latent.shape[1]), dtype=torch.bool, device=support_images.device),
-                support_valid,
-            ),
-            dim=1,
-        )
-        latent = self._run(self.encoder, torch.cat((latent, image_tokens), dim=1), key_padding_mask=token_mask)[:, : latent.shape[1]]
-        if return_view_features:
-            return latent, view_features
+        if self.no_z_enabled:
+            if not support_valid.any(dim=1).all():
+                raise ValueError("no-Z encoding requires valid support tokens in every sample")
+            # Token positions remain in [view, pooled patch] order, including masked slots.
+            latent = self._run(self.encoder, image_tokens, key_padding_mask=support_valid)
+            memory_mask = support_valid
+        else:
+            latent = self.latent_tokens.unsqueeze(0).expand(b, -1, -1)
+            token_mask = torch.cat(
+                (
+                    torch.ones((b, latent.shape[1]), dtype=torch.bool, device=support_images.device),
+                    support_valid,
+                ),
+                dim=1,
+            )
+            latent = self._run(self.encoder, torch.cat((latent, image_tokens), dim=1), key_padding_mask=token_mask)[:, : latent.shape[1]]
+            memory_mask = torch.ones(latent.shape[:2], dtype=torch.bool, device=latent.device)
+        if return_view_features or return_memory_mask:
+            result = [latent]
+            if return_view_features:
+                result.append(view_features)
+            if return_memory_mask:
+                result.append(memory_mask)
+            return tuple(result)
         return latent
 
     def decode_query_features(
-        self, latent: torch.Tensor, query_image: torch.Tensor, query_intrinsics: torch.Tensor
+        self, latent: torch.Tensor, query_image: torch.Tensor, query_intrinsics: torch.Tensor,
+        memory_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode image and scene conditioning into one token per query patch."""
         if query_image.ndim != 4 or query_intrinsics.shape != (query_image.shape[0], 3, 3):
@@ -267,7 +287,14 @@ class LVSMNeuLoc(nn.Module):
         cond = torch.cat((rgb, local_patch, zero_patch), dim=-1)
         query_tokens = self.query_tokenizer(cond) + self.token_type_embedding.weight[2].view(1, 1, -1)
         decoder_input = self.decoder_norm(torch.cat((query_tokens, latent), dim=1))
-        return self._run(self.decoder, decoder_input)[:, : self.patch_count]
+        if self.no_z_enabled and memory_mask is None:
+            raise ValueError("no-Z decoding requires its encoded support memory mask")
+        decoder_mask = None
+        if memory_mask is not None:
+            if memory_mask.shape != latent.shape[:2]:
+                raise ValueError("memory_mask must match encoded support tokens")
+            decoder_mask = torch.cat((torch.ones(query_tokens.shape[:2], device=query_tokens.device, dtype=torch.bool), memory_mask), dim=1)
+        return self._run(self.decoder, decoder_input, decoder_mask)[:, : self.patch_count]
 
     def _stage_tokens(self, batch: int, stage_index: int | torch.Tensor, device: torch.device) -> torch.Tensor:
         if not self.local_refinement_enabled:
@@ -414,8 +441,9 @@ class LVSMNeuLoc(nn.Module):
         support_poses: torch.Tensor | None = None,
         support_view_features: torch.Tensor | None = None,
         support_mask: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> RayOutput:
-        output = self.decode_query_features(latent, query_image, query_intrinsics)
+        output = self.decode_query_features(latent, query_image, query_intrinsics, memory_mask)
         directions = F.normalize(self.direction_head(output), dim=-1)
         moments_raw = self.moment_head(output)
         moments = moments_raw - (moments_raw * directions).sum(-1, keepdim=True) * directions
@@ -436,7 +464,12 @@ class LVSMNeuLoc(nn.Module):
             view_token_count=view_token_count,
             support_token_budget=support_token_budget,
             return_view_features=self.relative_pose_enabled,
+            return_memory_mask=self.no_z_enabled,
         )
+        memory_mask = None
+        if self.no_z_enabled:
+            *encoded, memory_mask = encoded
+            encoded = tuple(encoded) if self.relative_pose_enabled else encoded[0]
         if self.relative_pose_enabled:
             latent, view_features = encoded
         else:
@@ -444,4 +477,5 @@ class LVSMNeuLoc(nn.Module):
         return self.decode_query(
             latent, query_image, query_intrinsics, support_poses=support_poses,
             support_view_features=view_features, support_mask=support_mask,
+            memory_mask=memory_mask,
         )

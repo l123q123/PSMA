@@ -109,12 +109,17 @@ class RayDiffusionNeuLoc(LVSMNeuLoc):
             view_token_count=view_token_count,
             support_token_budget=support_token_budget,
             return_view_features=self.relative_pose_enabled,
+            return_memory_mask=self.no_z_enabled,
         )
+        memory_mask = None
+        if self.no_z_enabled:
+            *encoded, memory_mask = encoded
+            encoded = tuple(encoded) if self.relative_pose_enabled else encoded[0]
         if self.relative_pose_enabled:
             latent, view_features = encoded
         else:
             latent, view_features = encoded, None
-        return latent, self.decode_query_features(latent, query_image, query_intrinsics), view_features
+        return latent, self.decode_query_features(latent, query_image, query_intrinsics, memory_mask), view_features
 
     def denoise_from_features(
         self, query_features: torch.Tensor, noisy_rays: torch.Tensor, timesteps: torch.Tensor

@@ -63,6 +63,7 @@ def load_model(checkpoint: str | Path, device: torch.device, image_size: int) ->
     if dim % head_dim:
         raise ValueError("checkpoint attention head dimension does not divide model dimension")
     config = payload.get("model_config", {})
+    no_z = bool(config.get("no_z", False))
     relative_pose = bool(config.get("relative_pose", False) or "relative_pose_head.weight" in state)
     local_refinement = bool(config.get("local_refinement", False) or "refinement_stage_embedding.weight" in state)
     relative_robust_center_scale = float(config.get("relative_robust_center_scale", 0.25))
@@ -79,6 +80,7 @@ def load_model(checkpoint: str | Path, device: torch.device, image_size: int) ->
             relative_pose=relative_pose,
             relative_robust_center_scale=relative_robust_center_scale,
             local_refinement=local_refinement,
+            no_z=no_z,
         )
     else:
         model = LVSMNeuLoc(
@@ -87,6 +89,7 @@ def load_model(checkpoint: str | Path, device: torch.device, image_size: int) ->
             relative_pose=relative_pose,
             relative_robust_center_scale=relative_robust_center_scale,
             local_refinement=local_refinement,
+            no_z=no_z,
         )
     model.load_state_dict(state, strict=True)
     return model.to(device).eval()
