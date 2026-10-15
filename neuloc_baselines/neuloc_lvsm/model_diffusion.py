@@ -49,6 +49,9 @@ class RayDiffusionNeuLoc(LVSMNeuLoc):
         *args,
         diffusion_layers: int = 4,
         diffusion_steps: int = 50,
+        diffusion_beta_start: float = 1e-4,
+        diffusion_beta_end: float = .02,
+        diffusion_sampler: str = "ddim",
         moment_scale: float = 1.0,
         **kwargs,
     ) -> None:
@@ -58,7 +61,10 @@ class RayDiffusionNeuLoc(LVSMNeuLoc):
         if moment_scale <= 0:
             raise ValueError("moment_scale must be positive")
         self.moment_scale = float(moment_scale)
-        self.diffusion_schedule = RayDiffusionSchedule(diffusion_steps)
+        if diffusion_sampler not in ("ddim", "ddpm_mean"):
+            raise ValueError("unknown diffusion sampler")
+        self.diffusion_sampler = diffusion_sampler
+        self.diffusion_schedule = RayDiffusionSchedule(diffusion_steps, diffusion_beta_start, diffusion_beta_end)
         self.diffusion_ray_tokenizer = nn.Linear(6, self.dim, bias=False)
         self.diffusion_time_mlp = nn.Sequential(
             nn.Linear(self.dim, self.dim), nn.SiLU(), nn.Linear(self.dim, self.dim),
@@ -76,6 +82,13 @@ class RayDiffusionNeuLoc(LVSMNeuLoc):
             self.local_diffusion_blocks = copy.deepcopy(self.diffusion_blocks)
             self.local_diffusion_norm = copy.deepcopy(self.diffusion_norm)
             self.local_diffusion_head = copy.deepcopy(self.diffusion_head)
+
+    def diffusion_config(self) -> dict:
+        """Schedule buffers are reconstructed from saved configuration on reload."""
+        return dict(diffusion_train_steps=self.diffusion_schedule.steps,
+            diffusion_beta_start=self.diffusion_schedule.beta_start,
+            diffusion_beta_end=self.diffusion_schedule.beta_end,
+            diffusion_sampler=self.diffusion_sampler, moment_scale=self.moment_scale)
 
     def initialize_local_diffusion_from_global(self) -> None:
         """Copy a loaded Global denoiser into the independent local branch."""
@@ -220,9 +233,11 @@ class RayDiffusionNeuLoc(LVSMNeuLoc):
         sample_steps: int = 16,
         generator: torch.Generator | None = None,
     ) -> RayOutput:
-        """Sample a query ray field by deterministic DDIM from Gaussian noise."""
+        """Sample from Gaussian noise with the model's saved inference protocol."""
         if sample_steps < 2 or sample_steps > self.diffusion_schedule.steps:
             raise ValueError("sample_steps must be in [2, diffusion_steps]")
+        if self.diffusion_sampler == "ddpm_mean" and sample_steps != self.diffusion_schedule.steps:
+            raise ValueError("DDPM mean sampling must visit all training timesteps")
         latent, features, view_features = self.condition_features(
             support_images, support_intrinsics, support_poses, query_image, query_intrinsics,
             support_type_ids=support_type_ids, support_mask=support_mask,
@@ -239,9 +254,16 @@ class RayDiffusionNeuLoc(LVSMNeuLoc):
         for index, timestep in enumerate(schedule_times):
             current = torch.full((features.shape[0],), timestep, device=features.device, dtype=torch.long)
             predicted_x0 = self.denoise_from_features(features, raw_rays, current)
-            previous_value = schedule_times[index + 1] if index + 1 < len(schedule_times) else -1
-            previous = torch.full_like(current, previous_value)
-            raw_rays = self.diffusion_schedule.ddim_step(raw_rays, predicted_x0, current, previous)
+            if self.diffusion_sampler == "ddpm_mean":
+                # Follow the ray-diffusion inference convention: project clean rays
+                # before the posterior update, and bound the evolving noisy state.
+                directions, moments = canonicalize_rays(predicted_x0, self.moment_scale)
+                predicted_x0 = torch.cat((directions, moments / self.moment_scale), dim=-1)
+                raw_rays = self.diffusion_schedule.ddpm_mean_step(raw_rays, predicted_x0, current).clamp(-5., 5.)
+            else:
+                previous_value = schedule_times[index + 1] if index + 1 < len(schedule_times) else -1
+                previous = torch.full_like(current, previous_value)
+                raw_rays = self.diffusion_schedule.ddim_step(raw_rays, predicted_x0, current, previous)
         directions, moments = canonicalize_rays(predicted_x0, self.moment_scale)
         relative = None
         if self.relative_pose_enabled:

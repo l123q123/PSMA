@@ -76,6 +76,9 @@ def load_model(checkpoint: str | Path, device: torch.device, image_size: int) ->
             encoder_layers=encoder_layers, decoder_layers=decoder_layers, heads=dim // head_dim,
             diffusion_layers=diffusion_layers,
             diffusion_steps=int(config.get("diffusion_train_steps", 50)),
+            diffusion_beta_start=float(config.get("diffusion_beta_start", 1e-4)),
+            diffusion_beta_end=float(config.get("diffusion_beta_end", .02)),
+            diffusion_sampler=str(config.get("diffusion_sampler", "ddim")),
             moment_scale=float(config.get("moment_scale", 1.0)),
             relative_pose=relative_pose,
             relative_robust_center_scale=relative_robust_center_scale,
@@ -107,8 +110,10 @@ def predict(
         support_token_budget=_batch_scalar(batch, "support_token_budget"),
     )
     if isinstance(model, RayDiffusionNeuLoc):
+        if diffusion_steps == 0:
+            diffusion_steps = model.diffusion_schedule.steps if model.diffusion_sampler == "ddpm_mean" else 16
         if diffusion_steps < 2:
-            raise ValueError("diffusion evaluation requires at least two DDIM steps")
+            raise ValueError("diffusion evaluation requires at least two steps")
         output = model.sample(
             batch["support_images"], batch["support_intrinsics"], batch["support_poses"],
             batch["query_image"], batch["query_intrinsics"], sample_steps=diffusion_steps, **model_kwargs,
@@ -149,7 +154,7 @@ def main() -> None:
     parser.add_argument("--max-support-views", type=int, default=0,
                         help="pad support tensors to this many slots; 0 disables padding")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--diffusion-steps", type=int, default=16, help="DDIM steps for diffusion checkpoints")
+    parser.add_argument("--diffusion-steps", type=int, default=0, help="0 uses checkpoint sampler defaults")
     args = parser.parse_args()
     device = torch.device(args.device)
     max_support_views = args.max_support_views if args.max_support_views > 0 else None

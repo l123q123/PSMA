@@ -106,12 +106,16 @@ def validate_training_args(args: argparse.Namespace) -> None:
     elif args.ray_checkpoint or args.official_lvsm_checkpoint:
         raise ValueError("--official-lvsm-checkpoint and --ray-checkpoint require --full-lvsm-ray")
     if args.ray_diffusion:
+        if not 0 < args.diffusion_beta_start < args.diffusion_beta_end < 1:
+            raise ValueError("diffusion betas must satisfy 0 < start < end < 1")
         if args.diffusion_train_steps < 2:
             raise ValueError("diffusion train steps must be at least two")
         if args.diffusion_sample_steps < 2 or args.diffusion_sample_steps > args.diffusion_train_steps:
             raise ValueError("diffusion sample steps must be between two and diffusion train steps")
         if args.moment_scale <= 0:
             raise ValueError("moment scale must be positive")
+        if args.diffusion_sampler == "ddpm_mean" and args.diffusion_sample_steps != args.diffusion_train_steps:
+            raise ValueError("DDPM mean sampling must visit all training timesteps")
 
 
 def validate_visible_gpu_count(world_size: int, visible_gpu_count: int) -> None:
@@ -148,6 +152,12 @@ def load_resume_model(model: torch.nn.Module, checkpoint_path: str | Path) -> tu
     payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("model"), dict):
         raise ValueError("resume checkpoint must contain a model state dictionary")
+    if isinstance(model, RayDiffusionNeuLoc):
+        saved = payload.get("model_config", {})
+        defaults = dict(diffusion_train_steps=50, diffusion_beta_start=1e-4,
+            diffusion_beta_end=.02, diffusion_sampler="ddim", moment_scale=1.)
+        if any(saved.get(key, defaults[key]) != value for key, value in model.diffusion_config().items()):
+            raise ValueError("resume diffusion configuration differs; use --lvsm-checkpoint for explicit weight transfer")
     model.load_state_dict(payload["model"], strict=True)
     return int(payload.get("epoch", -1)) + 1, float(payload.get("loss", float("inf")))
 
@@ -307,6 +317,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diffusion-layers", type=int, default=4)
     parser.add_argument("--diffusion-train-steps", type=int, default=50)
     parser.add_argument("--diffusion-sample-steps", type=int, default=16)
+    parser.add_argument("--diffusion-beta-start", type=float, default=1e-4)
+    parser.add_argument("--diffusion-beta-end", type=float, default=.02)
+    parser.add_argument("--diffusion-sampler", choices=("ddim", "ddpm_mean"), default="ddim")
     parser.add_argument("--moment-scale", type=float, default=1.0)
     parser.add_argument("--diffusion-ray-loss-weight", type=float, default=0.5)
     parser.add_argument("--diffusion-pose-loss-weight", type=float, default=1.0)
@@ -376,6 +389,9 @@ def main() -> None:
         model_kwargs.update(
             diffusion_layers=args.diffusion_layers,
             diffusion_steps=args.diffusion_train_steps,
+            diffusion_beta_start=args.diffusion_beta_start,
+            diffusion_beta_end=args.diffusion_beta_end,
+            diffusion_sampler=args.diffusion_sampler,
             moment_scale=args.moment_scale,
         )
     model = model_class(**model_kwargs).to(device)
@@ -426,6 +442,8 @@ def main() -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "run_config.json").write_text(json.dumps(vars(args), indent=2) + "\n")
         print(f"train_episodes={len(dataset)} seen_episodes={len(val_dataset) if val_dataset else 0} unseen_episodes={len(unseen_val_dataset) if unseen_val_dataset else 0} no_z={args.no_z} world_size={world_size}", flush=True)
+        if args.ray_diffusion:
+            print(f"diffusion_config={model.diffusion_config()} terminal_alpha_bar={float(model.diffusion_schedule.alphas_cumprod[-1]):.8g} timestep_sampling=uniform", flush=True)
     torch.manual_seed(args.seed + local_rank)
     global_step = 0
     for epoch in range(start_epoch, start_epoch + args.epochs):
@@ -435,6 +453,7 @@ def main() -> None:
         epoch_loss_sum = 0.0
         epoch_steps = 0
         train_pose_sums = torch.zeros(3, device=device, dtype=torch.float64)
+        timestep_counts = torch.zeros(args.diffusion_train_steps, device=device, dtype=torch.long) if args.ray_diffusion else None
         progress = tqdm(
             enumerate(loader), total=len(loader), desc=f"Train epoch {epoch}",
             dynamic_ncols=True, leave=True, disable=local_rank != 0,
@@ -454,7 +473,8 @@ def main() -> None:
                 global_stage = batch["stage_id"].reshape(-1) == 0
                 if args.ray_diffusion:
                     x0 = torch.cat((gt_dirs, gt_moments / args.moment_scale), dim=-1)
-                    timesteps = torch.randint(args.diffusion_train_steps, (x0.shape[0],), device=device)
+                    timesteps = model.diffusion_schedule.sample_timesteps(x0.shape[0], device)
+                    timestep_counts += torch.bincount(timesteps, minlength=args.diffusion_train_steps)
                     noisy_rays = model.diffusion_schedule.q_sample(x0, timesteps)
                     result = wrapped(
                         batch["support_images"], batch["support_intrinsics"], batch["support_poses"],
@@ -525,6 +545,8 @@ def main() -> None:
             )
             dist.all_reduce(epoch_stats, op=dist.ReduceOp.SUM)
             dist.all_reduce(train_pose_sums, op=dist.ReduceOp.SUM)
+            if timestep_counts is not None:
+                dist.all_reduce(timestep_counts, op=dist.ReduceOp.SUM)
             dist.barrier()
         else:
             epoch_stats = torch.tensor(
@@ -551,8 +573,12 @@ def main() -> None:
                     "relative_pose_loss_weight": args.relative_pose_loss_weight,
                     "relative_robust_center_scale": args.relative_robust_center_scale,
                     "local_refinement": args.local_refinement,
+                    **(model.diffusion_config() if args.ray_diffusion else {}),
                 },
             }
+            if timestep_counts is not None:
+                checkpoint["training_timestep_counts"] = timestep_counts.tolist()
+                print(f"epoch={epoch} timestep_bins={[int(part.sum()) for part in timestep_counts.tensor_split(4)]} visited_timesteps={int((timestep_counts > 0).sum())}/{args.diffusion_train_steps}", flush=True)
             print(f"epoch={epoch} train_denoise_metrics={checkpoint['train_denoise_metrics']}", flush=True)
             if checkpoint["loss"] < best_epoch_loss:
                 best_epoch_loss = checkpoint["loss"]

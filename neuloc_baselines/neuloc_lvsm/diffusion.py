@@ -102,7 +102,7 @@ def decode_local_ray_residual(
 
 
 class RayDiffusionSchedule(nn.Module):
-    """Linear DDPM schedule with deterministic DDIM transitions."""
+    """Linear noise schedule with deterministic DDIM or DDPM-mean transitions."""
 
     def __init__(self, steps: int = 50, beta_start: float = 1e-4, beta_end: float = 2e-2) -> None:
         super().__init__()
@@ -113,10 +113,16 @@ class RayDiffusionSchedule(nn.Module):
         betas = torch.linspace(beta_start, beta_end, steps, dtype=torch.float32)
         alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
         self.steps = steps
+        self.beta_start = float(beta_start)
+        self.beta_end = float(beta_end)
         self.register_buffer("betas", betas, persistent=False)
         self.register_buffer("alphas_cumprod", alphas_cumprod, persistent=False)
         self.register_buffer("sqrt_alphas_cumprod", alphas_cumprod.sqrt(), persistent=False)
         self.register_buffer("sqrt_one_minus_alphas_cumprod", (1.0 - alphas_cumprod).sqrt(), persistent=False)
+
+    def sample_timesteps(self, batch_size: int, device: torch.device, generator=None) -> torch.Tensor:
+        """Train over the entire noise range, not only the terminal timestep."""
+        return torch.randint(self.steps, (batch_size,), device=device, generator=generator)
 
     def _extract(self, values: torch.Tensor, timesteps: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
         if timesteps.ndim != 1 or timesteps.shape[0] != reference.shape[0]:
@@ -159,3 +165,16 @@ class RayDiffusionSchedule(nn.Module):
             torch.ones_like(previous_timesteps, dtype=self.alphas_cumprod.dtype),
         ).view(x_t.shape[0], *([1] * (x_t.ndim - 1))).to(x_t.dtype)
         return alpha_previous.sqrt() * predicted_x0 + (1.0 - alpha_previous).clamp_min(0.0).sqrt() * epsilon
+
+    def ddpm_mean_step(self, x_t: torch.Tensor, predicted_x0: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """Adjacent-step DDPM posterior mean, with no added stochastic noise."""
+        if x_t.shape != predicted_x0.shape:
+            raise ValueError("x_t and predicted_x0 must have the same shape")
+        alpha_t = self._extract(self.alphas_cumprod, timesteps, x_t)
+        beta_t = self._extract(self.betas, timesteps, x_t)
+        previous = self._extract(self.alphas_cumprod, (timesteps - 1).clamp_min(0), x_t)
+        first = (timesteps == 0).view(timesteps.shape[0], *([1] * (x_t.ndim - 1)))
+        previous = torch.where(first, torch.ones_like(previous), previous)
+        mean = (previous.sqrt() * beta_t * predicted_x0
+            + (1 - beta_t).sqrt() * (1 - previous) * x_t) / (1 - alpha_t)
+        return torch.where(first, predicted_x0, mean)

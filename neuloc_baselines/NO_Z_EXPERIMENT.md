@@ -4,6 +4,10 @@ This opt-in experiment changes the scene representation, not the localization
 objective. No overlap head, confidence gating, or new cross-attention is added.
 The immutable reference source is Git commit `b38abda`.
 
+The original 50-step run was paused after epoch0. Its outputs remain available;
+the corrected 100-step noise-coverage experiment is documented in
+`PAPER_SCHEDULE.md` and `configs/no_z_diffusion_paper_v2.json`.
+
 ## Architecture
 
 Original: pooled support tokens + learned Z -> 12-layer encoder -> Z outputs;

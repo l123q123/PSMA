@@ -1,0 +1,52 @@
+{
+  "status": "experimental; accuracy not yet established",
+  "purpose": "Correct terminal-noise mismatch before adding overlap confidence",
+  "reference": "https://github.com/jasonyzhang/RayDiffusion/blob/main/conf/config.yaml",
+  "architecture": "Existing per-view pools -> pretrained Encoder12 without Z -> query and support tokens through pretrained Decoder12 -> denoiser4 -> CAR",
+  "model": {
+    "no_z": true,
+    "image_size": 256,
+    "dim": 768,
+    "heads": 12,
+    "encoder_layers": 12,
+    "decoder_layers": 12,
+    "diffusion_layers": 4,
+    "diffusion_train_steps": 100,
+    "diffusion_beta_start": 0.0001,
+    "diffusion_beta_end": 0.2,
+    "diffusion_sampler": "ddpm_mean",
+    "diffusion_sample_steps": 100,
+    "timestep_sampling": "uniform integer in [0, 99]; one timestep per training episode",
+    "prediction_target": "x0, clean direction and moment channels",
+    "terminal_alpha_bar": 0.0000213996654761115,
+    "moment_scale": 1.0,
+    "confidence_auxiliary": false,
+    "relative_pose": false,
+    "local_refinement": false
+  },
+  "training": {
+    "initialization": "/data/wenhong/NeuLoc-lvsm/outputs/comprehensive_v1_raydiff_v1_7gpu_e10_scannetfix_e2to9/last.pt",
+    "initialization_policy": "Explicit strict-compatible weight transfer, not optimizer resume; schedule is intentionally replaced",
+    "train_episodes": 20632,
+    "stage_counts": {"global": 2299, "semi": 4875, "dense": 4875, "fine": 8583},
+    "epochs": 10,
+    "batch_size_per_gpu": 1,
+    "gpu_ids": [1, 2, 3, 4, 5, 6, 7],
+    "lr": 0.000002,
+    "new_lr": 0.00002,
+    "amp_dtype": "bf16",
+    "seed": 20261015,
+    "loss": "Unchanged x0 MSE + 0.5*(direction smooth L1 + 0.5*moment smooth L1) + original Global-masked CAR pose loss"
+  },
+  "validation": {
+    "seen_episodes": 5000,
+    "seen_stage_counts": {"global": 142, "semi": 466, "dense": 1289, "fine": 3103},
+    "seen_sampling": "Fixed seed; proportional stage then dataset/scene sampling, original indices recorded",
+    "unseen_episodes": 3204,
+    "train_probe_per_stage": 28,
+    "sampling_start": "Independent standard Gaussian rays; no query GT used as inference input",
+    "comparison_policy": "Compare old models on the same seen5000; do not compare new subset aggregates directly with old full-seen aggregates"
+  },
+  "output": "/data/wenhong/NeuLoc-no-z-v1/outputs/no_z_diffusion_paper_v2",
+  "paper_differences": "Only the diffusion noise schedule and deterministic DDPM principle follow RayDiffusion. Keep NeuLoc conditioning, pooling, losses and CAR. Full 100-step sampling returns final predicted x0; no paper-specific early-stop tuning. This is not a full paper reproduction."
+}
