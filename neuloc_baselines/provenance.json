@@ -1,0 +1,123 @@
+{
+  "archive_date": "2026-10-15",
+  "source_project": "/data/wenhong/NeuLoc-lvsm",
+  "source_policy": "Pre-direct-support compatibility snapshot; checkpoint compatibility and numerical outputs are verified, not byte-identical historical training source.",
+  "checkpoints": {
+    "v3": {
+      "path": "/data/wenhong/NeuLoc-lvsm/outputs/comprehensive_v1_full_ray_8gpu_e30_corrected/last.pt",
+      "sha256": "e3cf7e3446e90111fae825e62fed4ec42d6c4f27d113d5d1c05374db7a1c1f16",
+      "epoch": 29,
+      "loss": 0.06064261290312814,
+      "model_config": {},
+      "seen_val_metrics": {
+        "rotation_deg": 63.6358294310249,
+        "center_error": 0.7789156724623328,
+        "translation_error": 0.7427765793364179,
+        "ray_mse": 0.34376619548759096,
+        "moment_mse": 0.2390210338825389
+      },
+      "seen_val_metrics_by_stage": {
+        "global": {
+          "rotation_deg": 65.61521033077705,
+          "center_error": 0.820873982193539,
+          "translation_error": 0.7835974873838628,
+          "ray_mse": 0.35613785624247124,
+          "moment_mse": 0.25212753149808564
+        },
+        "semi": {
+          "rotation_deg": 63.8687819422088,
+          "center_error": 0.7850765389902913,
+          "translation_error": 0.7522090982605012,
+          "ray_mse": 0.34351844829104033,
+          "moment_mse": 0.23878494775070405
+        },
+        "dense": {
+          "rotation_deg": 62.49178054076253,
+          "center_error": 0.7603752938003251,
+          "translation_error": 0.722493683424863,
+          "ray_mse": 0.33844893621241984,
+          "moment_mse": 0.23353309728543867
+        },
+        "fine": {
+          "rotation_deg": 62.580105891588964,
+          "center_error": 0.749606103085433,
+          "translation_error": 0.7130763144316998,
+          "ray_mse": 0.3370339203673189,
+          "moment_mse": 0.23171741998479278
+        }
+      }
+    },
+    "diffusion_v1": {
+      "path": "/data/wenhong/NeuLoc-lvsm/outputs/comprehensive_v1_raydiff_v1_7gpu_e10_scannetfix_e2to9/last.pt",
+      "sha256": "f1850cb24d03556486ebdd024f0c1276e675d74e9dab34d44081490b40c917ad",
+      "epoch": 9,
+      "loss": 0.04416547299326253,
+      "model_config": {
+        "ray_diffusion": true,
+        "diffusion_layers": 4,
+        "diffusion_train_steps": 50,
+        "moment_scale": 1.0
+      },
+      "seen_val_metrics": {
+        "rotation_deg": 8.38954912777183,
+        "center_error": 0.19739583070319405,
+        "translation_error": 0.21773036354186298,
+        "ray_mse": 0.0140598238112778,
+        "moment_mse": 0.022057650978155482
+      },
+      "seen_val_metrics_by_stage": {
+        "global": {
+          "rotation_deg": 21.503877321995486,
+          "center_error": 0.5116271643904232,
+          "translation_error": 0.5210327197589019,
+          "ray_mse": 0.06966648093953154,
+          "moment_mse": 0.11141532995482824
+        },
+        "semi": {
+          "rotation_deg": 14.177616615063352,
+          "center_error": 0.32185101273024214,
+          "translation_error": 0.3493002826427091,
+          "ray_mse": 0.03864972663383812,
+          "moment_mse": 0.05074295151319351
+        },
+        "dense": {
+          "rotation_deg": 8.31691282952212,
+          "center_error": 0.19527321848454826,
+          "translation_error": 0.21855745421167813,
+          "ray_mse": 0.013235439044678462,
+          "moment_mse": 0.02119763066611062
+        },
+        "fine": {
+          "rotation_deg": 6.950663343478699,
+          "center_error": 0.16521786513141146,
+          "translation_error": 0.1837556669315144,
+          "ray_mse": 0.008166154475074724,
+          "moment_mse": 0.014022219106648987
+        }
+      }
+    }
+  },
+  "archived_source_sha256": {
+    "neuloc_lvsm/__init__.py": "464bb90c534bfa638b2c936f2d8615ca23d2e4cfca3fccb2901f025d6f87a0a3",
+    "neuloc_lvsm/checkpoint.py": "a6cab5f4b868775e62703884cd493d8820ff71f6f7ea75b578bbd0a7ca213407",
+    "neuloc_lvsm/data.py": "7a5e97fa47475df2fbd8d487fb220329aeb99bb07fa964101f723d1df8ab7b8c",
+    "neuloc_lvsm/diffusion.py": "bd7297237c95fd49d859812721f21f1c43a0b1e7d2c749c2a9e0012b8fd0b6c0",
+    "neuloc_lvsm/evaluate.py": "a49f2e9e5aaa510bd4c48e12b7d6c35a625cebc6bd6e29fcae8760e5967f6bdc",
+    "neuloc_lvsm/geometry.py": "7c7e5d5d61394d483ae134355311ee86dbc162627d5b789d04a66ab71a29082d",
+    "neuloc_lvsm/model.py": "e5d318f21a1d1609fac492960d4532513b7ace0cfb7b2d00252db7133a2d7777",
+    "neuloc_lvsm/model_diffusion.py": "5b2264280d788dcfb8aecc7f6d6596de86eddb0fe081cd9ecbd76a92b5909bf4",
+    "neuloc_lvsm/solver.py": "6996214e93f3b1c33d17905dbbc8d382db6c8006a54702272b963413b3c31c1e",
+    "neuloc_lvsm/transformer.py": "079f3d5128c67666035fd31fd21058aaf6e708dd202f3ea9403a185433235686",
+    "tests/test_anchor_geometry.py": "210e8e7eb12ec1084652b8b84c7a7e0e00a1fac8861c983f588fda8a45f99f57",
+    "tests/test_archive_profiles.py": "13b6cae7813ab450278400e6fbc88d1dbfa2bad6d0628814a9235011b6c19ba1",
+    "tests/test_dual_validation_config.py": "e491eadacb94b070e8753ab2367776e14671dc93c20ce61098f07c774e81524d",
+    "tests/test_patch_coordinate_convention.py": "fd356fb30d6a1d3bb8b439c9d19b022b9333b9de1a2cec69a9c63c2ed52ff85c",
+    "tests/test_ray_output_moments.py": "1c8f9d9b5b1355e442922976d1dffc20e51cb5af00697702d81f3007a4444ab9",
+    "tests/test_support_mask.py": "c5b828a8aedbea348577ba25e469eb58978648c91efe7f9fe93900ab236c41e9",
+    "tests/test_token_budget_dataset.py": "9975c93e202f4f86bfd7cbc2a12202ec58a422f54a60d0470e9eb9ca78a6c569",
+    "tests/test_validation.py": "0338bdd0441ae1aac9a5bab88938d4cb37bba3c576e0d5fa7488d2ab0b4540d5",
+    "tests/test_view_token_pool.py": "65c0c8154aeb1d32e287e4f6d7ec2dcc4727eab0bfda99bb34df55a762d0d2c3",
+    "train.py": "47d5fbfdd303a570f7332a8f1b45131f39a311759e59c72299721afcf1825177",
+    "verify_server_checkpoints.py": "30879d1a71865550da0e3a29f6fbbc0030c074ea876827297f015f7a5587bb35"
+  }
+}

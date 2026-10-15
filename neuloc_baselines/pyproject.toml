@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuloc-baselines"
+version = "0.1.0"
+description = "Z-preserving V3 ray regression and Ray Diffusion v1 baselines"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1", "numpy>=1.24", "Pillow>=9", "tqdm>=4.64", "safetensors>=0.4"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["neuloc_lvsm*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

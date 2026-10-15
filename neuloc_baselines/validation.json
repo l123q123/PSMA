@@ -1,0 +1,37 @@
+{
+  "device": "physical GPU1",
+  "torch_version": "2.6.0+cu124",
+  "batch_shape": [
+    1,
+    100,
+    3,
+    256,
+    256
+  ],
+  "profiles": {
+    "v3": {
+      "strict_state_load": true,
+      "all_checkpoint_tensors_equal": true,
+      "latent_shape": [
+        1,
+        3072,
+        768
+      ],
+      "latent_max_abs_delta": 0.0,
+      "directions_max_abs_delta": 0.0,
+      "moments_max_abs_delta": 0.0
+    },
+    "diffusion_v1": {
+      "strict_state_load": true,
+      "all_checkpoint_tensors_equal": true,
+      "latent_shape": [
+        1,
+        3072,
+        768
+      ],
+      "latent_max_abs_delta": 0.0,
+      "directions_max_abs_delta": 0.0,
+      "moments_max_abs_delta": 0.0
+    }
+  }
+}

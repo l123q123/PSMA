@@ -1,0 +1,30 @@
+{
+  "version": "v3",
+  "description": "Z-preserving direct Pluecker-ray regression, without ray diffusion",
+  "model": {
+    "ray_diffusion": false,
+    "image_size": 256,
+    "patch_size": 8,
+    "dim": 768,
+    "latent_count": 3072,
+    "encoder_layers": 12,
+    "decoder_layers": 12,
+    "heads": 12,
+    "relative_pose": false,
+    "local_refinement": false
+  },
+  "training": {
+    "support_views": 0,
+    "completed_checkpoint_epoch": 29,
+    "historical_learning_rates": null,
+    "note": "Architecture and epoch verified from the actual checkpoint. Exact original V3 launch command is not recovered; do not interpret current CLI defaults as historical hyperparameters."
+  },
+  "stage_tokens": {
+    "global": [100, 80],
+    "semi": [50, 160],
+    "dense": [20, 400],
+    "fine": [8, 1024]
+  },
+  "checkpoint_reference": "outputs/comprehensive_v1_full_ray_8gpu_e30_corrected/last.pt",
+  "checkpoint_distribution": "server-only; weights are not included in Git"
+}
